@@ -1,0 +1,4 @@
+# Required libraries for the free_games_bot.py script
+requests
+discord-webhooks
+
