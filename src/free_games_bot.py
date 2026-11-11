@@ -101,17 +101,84 @@ class ITADRequestError(RuntimeError):
 
 
 class ITADClient:
-    STORES_URL = "https://api.isthereanydeal.com/v01/web/stores/all/"
-    DEALS_URL = "https://api.isthereanydeal.com/v01/deals/list/"
+    STORES_URL = "https://api.isthereanydeal.com/service/shops/v1"
+    DEALS_URL = "https://api.isthereanydeal.com/deals/v2"
     TIMEOUT = 15
+    PAGE_LIMIT = 200
+    TOTAL_LIMIT = 4000
 
-    def _get_json(self, url, params, endpoint):
+    @staticmethod
+    def _http_error_message(endpoint, response, api_key):
+        status_code = response.status_code
+        reason = getattr(response, 'reason', '')
+        message = "ITAD {} request failed: HTTP {}{}.".format(
+            endpoint,
+            status_code,
+            " " + reason if reason else '',
+        )
+
         try:
-            response = requests.get(url, params=params, timeout=self.TIMEOUT)
+            body = response.json()
+            if isinstance(body, dict):
+                reason_phrase = body.get('reason_phrase') or body.get('message')
+                details = body.get('details')
+                if reason_phrase:
+                    body = "{}{}".format(
+                        reason_phrase,
+                        "; details={}".format(details) if details is not None else '',
+                    )
+                else:
+                    body = json.dumps(body, ensure_ascii=True)
+            else:
+                body = json.dumps(body, ensure_ascii=True)
+        except ValueError:
+            body = getattr(response, 'text', '') or ''
+
+        body = str(body)
+        if api_key:
+            body = body.replace(api_key, '[REDACTED]')
+        if body:
+            message += " Response: {}".format(body[:500])
+
+        retry_after = response.headers.get('Retry-After')
+        if retry_after:
+            message += " Retry-After: {} seconds.".format(retry_after)
+
+        suggestions = {
+            400: "Check the V2 query parameters: country, active numeric shop IDs, offset, and a per-request limit from 1 to 200.",
+            401: "Verify the ITAD API key is current and sent in the ITAD-API-Key header.",
+            403: "Check that the API key is valid and the app has access to this endpoint.",
+            429: "Wait for the indicated Retry-After interval before trying again; avoid rapid repeated checks.",
+        }
+        suggestion = suggestions.get(status_code)
+        if status_code is not None and status_code >= 500:
+            suggestion = "ITAD may be temporarily unavailable; retry later and check the API service status."
+        if suggestion:
+            message += " Suggested action: {}".format(suggestion)
+        return message
+
+    def _get_json(self, url, params, endpoint, api_key=None):
+        headers = {'ITAD-API-Key': api_key} if api_key else None
+        try:
+            response = requests.get(url, params=params, headers=headers, timeout=self.TIMEOUT)
             response.raise_for_status()
+        except requests.exceptions.HTTPError as error:
+            response = error.response
+            if response is None:
+                raise ITADRequestError(
+                    "ITAD {} request failed with HTTPError and no response details.".format(endpoint)
+                ) from None
+            raise ITADRequestError(
+                self._http_error_message(endpoint, response, api_key)
+            ) from None
         except requests.exceptions.RequestException as error:
             raise ITADRequestError(
-                "ITAD {} request failed ({}).".format(endpoint, type(error).__name__)
+                "ITAD {} request failed before an HTTP response ({}, timeout={}s). "
+                "Check network access, DNS, firewall/proxy settings, then retry.".format(
+                    endpoint,
+                    type(error).__name__,
+                    self.TIMEOUT,
+                )
             ) from None
 
         try:
@@ -119,28 +186,61 @@ class ITADClient:
         except ValueError:
             raise ITADRequestError("ITAD {} returned invalid JSON.".format(endpoint)) from None
 
-    def get_all_shops(self):
-        response = self._get_json(self.STORES_URL, None, "store list")
+    def get_all_shops(self, country='US'):
+        response = self._get_json(self.STORES_URL, {'country': country}, "store list")
         try:
-            shops = response['data']
+            shops = response
             if not isinstance(shops, list):
                 raise TypeError
-            return [shop['id'] for shop in shops]
-        except (KeyError, TypeError):
+            if not all(isinstance(shop, dict) and 'id' in shop and 'title' in shop for shop in shops):
+                raise TypeError
+            return shops
+        except TypeError:
             raise ITADRequestError("ITAD store list response has an unexpected format.") from None
 
     def get_deals(self, params):
-        response = self._get_json(self.DEALS_URL, params, "deals list")
-        try:
-            deals = response['data']['list']
-            if not isinstance(deals, list):
-                raise TypeError
-            return deals
-        except (KeyError, TypeError):
-            raise ITADRequestError("ITAD deals list response has an unexpected format.") from None
+        query = dict(params)
+        api_key = query.pop('key', None)
+        requested_limit = int(query.pop('limit', self.PAGE_LIMIT) or self.PAGE_LIMIT)
+        total_limit = min(requested_limit, self.TOTAL_LIMIT)
+        if total_limit < 1:
+            raise ValueError("The deals limit must be at least 1.")
+
+        offset = int(query.pop('offset', 0) or 0)
+        if offset < 0:
+            raise ValueError("The deals offset cannot be negative.")
+        query.pop('region', None)
+        if query.get('sort') == 'cut:desc':
+            query['sort'] = '-cut'
+        query.setdefault('nondeals', False)
+        query.setdefault('mature', False)
+        query = {key: value for key, value in query.items() if value not in (None, '')}
+
+        deals = []
+        while len(deals) < total_limit:
+            page_limit = min(self.PAGE_LIMIT, total_limit - len(deals))
+            page_params = dict(query, offset=offset, limit=page_limit)
+            response = self._get_json(self.DEALS_URL, page_params, "deals list", api_key)
+            try:
+                page = response['list']
+                has_more = response['hasMore']
+                next_offset = response['nextOffset']
+                if not isinstance(page, list) or not isinstance(has_more, bool) or not isinstance(next_offset, int):
+                    raise TypeError
+            except (KeyError, TypeError):
+                raise ITADRequestError("ITAD deals list response has an unexpected format.") from None
+
+            deals.extend(page[:total_limit - len(deals)])
+            if not has_more or len(deals) >= total_limit:
+                break
+            if next_offset <= offset:
+                raise ITADRequestError("ITAD deals pagination returned a non-advancing offset.")
+            offset = next_offset
+
+        return deals
 
 
-def resolve_shops(store_filter, api_client):
+def resolve_shops(store_filter, api_client, country='US'):
     if not isinstance(store_filter, dict):
         raise ValueError("store_filter must be an object.")
     if 'include' in store_filter and 'exclude' in store_filter:
@@ -156,10 +256,35 @@ def resolve_shops(store_filter, api_client):
     if not isinstance(shops, (list, tuple, set)):
         raise ValueError("store_filter values must be a list of shop IDs.")
 
+    available_shops = api_client.get_all_shops(country)
+    shops_by_name = {
+        ''.join(character for character in shop['title'].casefold() if character.isalnum()): shop['id']
+        for shop in available_shops
+    }
+    shop_ids = {int(shop['id']) for shop in available_shops}
+
+    def resolve_shop(shop):
+        try:
+            shop_id = int(shop)
+        except (TypeError, ValueError):
+            shop_id = shops_by_name.get(
+                ''.join(character for character in str(shop).casefold() if character.isalnum())
+            )
+        if shop_id not in shop_ids:
+            if 'exclude' in store_filter:
+                print("Ignoring excluded ITAD shop not active for {}: {}".format(country, shop))
+                return None
+            raise ValueError("Unknown active ITAD shop: {}".format(shop))
+        return shop_id
+
+    selected_ids = set()
+    for shop in shops:
+        shop_id = resolve_shop(shop)
+        if shop_id is not None:
+            selected_ids.add(shop_id)
     if 'exclude' in store_filter:
-        excluded_shops = set(shops)
-        shops = [shop for shop in api_client.get_all_shops() if shop not in excluded_shops]
-    return ','.join(str(shop) for shop in shops)
+        selected_ids = shop_ids - selected_ids
+    return ','.join(str(shop_id) for shop_id in sorted(selected_ids))
 
 
 '''*******************************************************************
@@ -187,7 +312,7 @@ class Bot_Profile:
             self.game_filters = dict(profile_info.get('game_filters', {}))
             if 'exclude_keywords' not in self.game_filters and 'exclude_keywords' in self.store_filter:
                 self.game_filters['exclude_keywords'] = self.store_filter['exclude_keywords']
-            self.api_params['shops'] = self.filter_shops()
+            self.api_params['shops'] = self.filter_shops(self.api_params.get('country') or 'US')
 
             self.games = []
 
@@ -226,10 +351,12 @@ class Bot_Profile:
     def get_all_shops(self):
         return self.api_client.get_all_shops()
 
-    def filter_shops(self):
-        return resolve_shops(self.store_filter, self.api_client)
+    def filter_shops(self, country='US'):
+        return resolve_shops(self.store_filter, self.api_client, country)
 
     def game_filter_check(self, game):
+        if not self.api_params.get('mature', False) and getattr(game, 'mature', False):
+            return False
         for game_filter in self.game_filters:
             filter_game = self.game_filter_funcs.get(game_filter)
             if filter_game is None:
@@ -282,19 +409,24 @@ class Bot_Profile:
         print( str(self.tracking_json) + " updated!")
 
 class Game:
-    def __init__(self, game_info=None, currency="CAD" ):
+    def __init__(self, game_info=None, currency=None):
         if game_info != None:
-            self.added = game_info['added']
-            self.drm = game_info['drm']
-            self.expiry = game_info['expiry']
-            self.plain = game_info['plain']
-            self.price_cut = game_info['price_cut']
-            self.price_new = game_info['price_new']
-            self.price_old = game_info['price_old']
-            self.shop = game_info['shop']['name']
+            deal = game_info['deal']
+            price = deal['price']
+            regular = deal['regular']
+
+            self.added = deal['timestamp']
+            self.drm = deal.get('drm', [])
+            self.expiry = deal['expiry']
+            self.plain = game_info.get('slug', '')
+            self.price_cut = deal['cut']
+            self.price_new = price['amount']
+            self.price_old = regular['amount']
+            self.currency = price.get('currency', currency or 'CAD')
+            self.shop = deal['shop']['name']
             self.title = game_info['title']
-            self.plain = game_info['plain']
-            self.url = game_info['urls']['buy']
+            self.url = deal['url']
+            self.mature = game_info.get('mature', False)
 
             self.web_hook = None
 
@@ -304,7 +436,7 @@ class Game:
             #                         "added":    self.added,
             #                         "price_cut":    self.price_cut }
 
-        price_str = str(self.price_new) + " " + currency
+        price_str = str(self.price_new) + " " + self.currency
         if self.price_new == 0.00:
             price_str = "Free"
         self.announce_text = "`{}` Is now on {} for {}! ({} % Off)\nGet it now: {}".format( self.title, 
@@ -354,12 +486,13 @@ default_settings = json.dumps( {
             "api_params": 
                 {
                     "key": "",
-                    "offset": "",
+                    "offset": 0,
                     "limit": 4000,
-                    "region": "",
                     "country": "CA",
                     "shops": "",
-                    "sort": "cut:desc"
+                    "sort": "-cut",
+                    "nondeals": False,
+                    "mature": False
                 },
             "web_hook_address": "",
             "store_filter": { 
@@ -412,7 +545,11 @@ def validate_profiles(settings, require_webhook=True):
 def run_api_check(profile_info, profile_name, api_client=None):
     api_client = api_client or ITADClient()
     api_params = dict(profile_info['api_params'])
-    api_params['shops'] = resolve_shops(profile_info.get('store_filter', {}), api_client)
+    api_params['shops'] = resolve_shops(
+        profile_info.get('store_filter', {}),
+        api_client,
+        api_params.get('country') or 'US',
+    )
     deals = api_client.get_deals(api_params)
     print("ITAD API check succeeded for '{}': received {} deals.".format(profile_name, len(deals)))
     return len(deals)

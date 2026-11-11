@@ -27,6 +27,8 @@ py src\free_games_bot.py --check-api Bot_Name
 
 This requires that profile's ITAD API key. It checks the store list when needed by the shop filter and then requests deals. It does not send webhooks or create/update tracking files.
 
+If the API rejects a request, the diagnostic reports the HTTP status, a short response detail, and a suggested action. For `429` responses it also reports `Retry-After`. You can share that diagnostic output for troubleshooting, but never share the API key, request headers, or the full settings file.
+
 To fetch and filter real deals without posting or saving tracking state:
 
 ```powershell
@@ -44,13 +46,14 @@ The settings JSON may contain multiple bot profiles, each with their own unique 
 ### API Paramters
 The API Parameters are key value pairs that are sent to the ITAD web API to specify what data you want to receive in the payload.
 
-* `key : ` The API Key from ITAD.
-* `offset : ` The position at which to start the search. ie. From the 500th entry.
-* `limit : ` The number after which to stop. ie. After 4000 entries. 
-* `region : ` Filters results by countries within a region.
-* `country : ` Filters deals by [country](https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2#Officially_assigned_code_elements), as well as determines the currency conversion.
-* `shops : ` Filter by specific shops.  This is set programmatically by the script based on the `store_filter`.
-* `sort : ` Criteria to sort by. ie. By price cut in descending order.
+* `key : ` The ITAD API key, sent in the `ITAD-API-Key` request header.
+* `offset : ` The starting position for the deals list; defaults to `0`.
+* `limit : ` The total number of deals to inspect. ITAD returns at most 200 per request; the script fetches additional pages up to this limit.
+* `country : ` Filters deals by [country](https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2#Officially_assigned_code_elements) and determines the returned currency.
+* `shops : ` Numeric ITAD shop IDs, resolved from the `store_filter` names or IDs.
+* `sort : ` V2 sort expression, e.g. `-cut` for largest discounts first.
+* `nondeals : ` Set to `false` to return sale prices only.
+* `mature : ` Set to `false` to exclude games ITAD marks as mature.
 
 ### Other Parameters
 * `web_hook_address : `The address of the webhook from your discord channel.
@@ -61,3 +64,17 @@ The API Parameters are key value pairs that are sent to the ITAD web API to spec
     * `max_price_new : `The maximum sale price to report, e.g., `20.00`.
     * `exclude_keywords : `Any problem keywords in game titles you don't want to hear about, e.g., `"demo,schweet,minion"`.
 * `tracking_json : `The filename of the tracking json to be created.  It's so you can give a unique name to your record per profile.  The record is the bot's memory of what it posted yesterday, e.g., `"posted_all_free.json"` or `posted_steam_discount.json`, named for their filters.
+
+For example, to find free Steam games while excluding titles containing `hentai`, set the shop and game filters like this:
+
+```json
+{
+    "store_filter": { "include": ["Steam"] },
+    "game_filters": {
+        "max_price_new": 0,
+        "exclude_keywords": "hentai"
+    }
+}
+```
+
+The shop name is resolved to the active numeric ITAD shop ID for the configured country. Excluded shops that are no longer active in that country are ignored with a warning; unknown included shops are rejected to avoid accidentally broadening the results. The title keyword filter is applied locally in addition to ITAD's `mature=false` request filter.
