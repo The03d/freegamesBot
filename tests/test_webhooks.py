@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 
 import requests
 
-from src.free_games_bot import DiscordWebhookSender, Game, SlackWebhooks
+from src.free_games_bot import DiscordWebhookSender, Game, SlackWebhooks, run_webhook_test
 
 
 class DiscordWebhookSenderTests(unittest.TestCase):
@@ -77,6 +77,38 @@ class DiscordWebhookSenderTests(unittest.TestCase):
 
         self.assertFalse(succeeded)
         self.assertNotIn(secret_url, output.getvalue())
+
+    @patch('src.free_games_bot.requests.post')
+    def test_webhook_test_sends_one_message_without_bot_or_tracking(self, post):
+        post.return_value = Mock()
+        profile = {'web_hook_address': 'https://discord.com/api/webhooks/test/token'}
+
+        self.assertTrue(run_webhook_test(profile, 'Test'))
+
+        post.assert_called_once()
+        payload = post.call_args.kwargs['json']
+        self.assertIn('FreeGamesBot webhook test for', payload['content'])
+        self.assertNotIn('deals', payload)
+
+    @patch('src.free_games_bot.requests.post')
+    def test_discord_http_error_details_redact_webhook_url(self, post):
+        webhook_url = 'https://discord.com/api/webhooks/test/private-token'
+        response = Mock()
+        response.status_code = 404
+        response.reason = 'Not Found'
+        response.json.return_value = {'message': 'Invalid webhook ' + webhook_url}
+        response.text = ''
+        http_error = requests.exceptions.HTTPError(response=response)
+        response.raise_for_status.side_effect = http_error
+        post.return_value = response
+        sender = DiscordWebhookSender(webhook_url, content='Probe')
+        output = StringIO()
+
+        with redirect_stdout(output):
+            self.assertFalse(sender.send())
+
+        self.assertIn('HTTP 404 Not Found', output.getvalue())
+        self.assertNotIn(webhook_url, output.getvalue())
 
 
 if __name__ == '__main__':

@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +12,7 @@ from src.free_games_bot import (
     Game,
     ITADClient,
     ITADRequestError,
+    run_profile,
     resolve_shops,
     run_api_check,
     validate_profiles,
@@ -317,6 +319,83 @@ class ProfileDiagnosticTests(unittest.TestCase):
             self.assertTrue(profile.game_tracking_check(duplicate))
             self.assertFalse(profile.game_tracking_check(changed_discount))
             self.assertEqual(tracking_path.read_text(), original_tracking)
+
+    def test_only_successfully_sent_games_are_added_to_tracking(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tracking_path = Path(temp_dir) / 'tracking.json'
+            profile = Bot_Profile(
+                self.profile_settings(tracking_path),
+                api_client=self.profile_api_client(),
+            )
+            posted_record = {'url': 'https://example.test/posted', 'price_cut': 100}
+            failed_record = {'url': 'https://example.test/failed', 'price_cut': 100}
+            profile.games = [
+                SimpleNamespace(
+                    send_web_hook=Mock(return_value=True),
+                    output_record=Mock(return_value=posted_record),
+                ),
+                SimpleNamespace(
+                    send_web_hook=Mock(return_value=False),
+                    output_record=Mock(return_value=failed_record),
+                ),
+            ]
+
+            with patch('src.free_games_bot.time.sleep'):
+                self.assertEqual(profile.send_games(), (1, 1))
+            profile.update_tracking_json()
+
+            self.assertEqual(json.loads(tracking_path.read_text()), [posted_record])
+
+    def test_run_profile_records_stats_and_redacts_secrets(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile_info = {
+                'api_params': {'key': 'private-api-key'},
+                'web_hook_address': 'https://discord.test/private-webhook',
+            }
+            bot = Mock()
+            bot.candidate_count = 5
+            bot.filtered_count = 2
+            bot.duplicate_count = 1
+            bot.games = [Mock(), Mock()]
+            bot.sent_count = 1
+            bot.failed_count = 1
+
+            with patch.dict('os.environ', {'FREEGAMESBOT_DATA_DIR': temp_dir}), \
+                    patch('src.free_games_bot.validate_profiles', return_value=True), \
+                    patch('src.free_games_bot.Bot_Profile', side_effect=RuntimeError(
+                        'failure private-api-key https://discord.test/private-webhook'
+                    )):
+                result = run_profile(profile_info, 'Test')
+
+            history = (Path(temp_dir) / 'run-history.jsonl').read_text().splitlines()
+            record = json.loads(history[0])
+            self.assertEqual(result['status'], 'failed')
+            self.assertNotIn('private-api-key', record['error'])
+            self.assertNotIn('private-webhook', record['error'])
+
+    def test_run_profile_records_success_counts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile_info = {
+                'api_params': {'key': 'test-key'},
+                'web_hook_address': 'https://discord.test/webhook',
+            }
+            bot = Mock()
+            bot.candidate_count = 5
+            bot.filtered_count = 2
+            bot.duplicate_count = 1
+            bot.games = [Mock(), Mock()]
+            bot.sent_count = 2
+            bot.failed_count = 0
+
+            with patch.dict('os.environ', {'FREEGAMESBOT_DATA_DIR': temp_dir}), \
+                    patch('src.free_games_bot.validate_profiles', return_value=True), \
+                    patch('src.free_games_bot.Bot_Profile', return_value=bot):
+                result = run_profile(profile_info, 'Test')
+
+            self.assertEqual(result['status'], 'success')
+            self.assertEqual(result['sent'], 2)
+            self.assertEqual(result['failed'], 0)
+            bot.update_tracking_json.assert_called_once_with()
 
     def test_api_check_uses_configured_shop_filter_without_webhook(self):
         api_client = Mock()

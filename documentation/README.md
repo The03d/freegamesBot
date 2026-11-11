@@ -37,6 +37,18 @@ py src\free_games_bot.py --dry-run Bot_Name
 
 The dry run reads an existing tracking file if present, prints a summary and up to five eligible games, and does not create or modify tracking files. Running the script without either diagnostic option is the production flow: it can post to configured webhooks and update tracking files.
 
+## Desktop Dashboard
+Install the requirements, including CustomTkinter, then start the Windows dashboard:
+
+```powershell
+py -m pip install -r requirements.txt
+py src\free_games_bot_ui.py
+```
+
+Select a profile and use **Test Webhook** to send one timestamped probe without fetching deals or changing tracking. **Run Profile** executes that profile's normal deal workflow. The dashboard can also create or remove daily and weekly Windows Task Scheduler jobs for the selected profile; scheduled tasks continue to run when the dashboard is closed.
+
+Only successfully delivered games are added to tracking, so failed deliveries can be retried on a later run. Run statistics and schedules are stored under `%LOCALAPPDATA%\FreeGamesBot`; scheduled task logs are stored there as well. The existing no-argument script invocation continues to run all configured profiles.
+
 ## Recommended:
 You can also optionally use [Task Scheduler](https://docs.microsoft.com/en-us/windows/win32/taskschd/task-scheduler-start-page) in Windows to run this script as often as you like. <br />
 

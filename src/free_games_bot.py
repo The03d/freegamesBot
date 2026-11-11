@@ -10,6 +10,10 @@ import requests
 import json
 import time
 import string
+import os
+import hashlib
+from datetime import datetime, timezone
+from pathlib import Path
 
 '''*******************************************************************
 ******************** Custom Webhooks Classes!!! **********************
@@ -40,8 +44,30 @@ class DiscordWebhookSender:
             request = requests.post(self.webhook_url, json=payload, timeout=10)
             request.raise_for_status()
             return True
+        except requests.exceptions.HTTPError as error:
+            response = error.response
+            if response is None:
+                print("Error: Discord webhook rejected the request (HTTP status unavailable).")
+            else:
+                try:
+                    body = response.json()
+                except ValueError:
+                    body = getattr(response, 'text', '') or ''
+                body = str(body).replace(self.webhook_url, '[REDACTED_WEBHOOK_URL]')[:500]
+                print(
+                    "Error: Discord webhook rejected the request (HTTP {} {}). {}".format(
+                        response.status_code,
+                        response.reason or '',
+                        body,
+                    )
+                )
+            return False
         except requests.exceptions.RequestException as error:
-            print('Error: %s' % error)
+            print(
+                "Error: Discord webhook request failed ({}). Check network access and try again.".format(
+                    type(error).__name__
+                )
+            )
             return False
 
 ## Slack webhooks was a little minimal, so I made my own based on Discord webhooks
@@ -323,6 +349,9 @@ class Bot_Profile:
         self.candidate_count = 0
         self.filtered_count = 0
         self.duplicate_count = 0
+        self.posted_records = []
+        self.sent_count = 0
+        self.failed_count = 0
 
 
     def passes_exclude_keywords(self, game):
@@ -384,8 +413,6 @@ class Bot_Profile:
                 self.filtered_count += 1
                 continue
 
-            self.session_info.append( game.output_record() )
-
             if self.game_tracking_check( game ):
                 self.duplicate_count += 1
                 continue
@@ -395,18 +422,38 @@ class Bot_Profile:
             self.games.append( game )
 
     def send_games( self ):
-        for game in self.games:
+        self.posted_records = []
+        self.sent_count = 0
+        self.failed_count = 0
+        for index, game in enumerate(self.games):
             succeeded = game.send_web_hook()
-            # self.session_info.append( game.output_record() )
             print("Succeeded?", succeeded)
-            time.sleep(2.0)
-            # if succeeded:
+            if succeeded:
+                self.sent_count += 1
+                self.posted_records.append(game.output_record())
+            else:
+                self.failed_count += 1
+            if index < len(self.games) - 1:
+                time.sleep(2.0)
+        return self.sent_count, self.failed_count
 
                 
     def update_tracking_json( self ):
-        f = open(self.tracking_json, 'w')
-        f.write(json.dumps(self.session_info, indent=4))
-        print( str(self.tracking_json) + " updated!")
+        tracked_records = list(self.tracking_info)
+        known_records = {
+            (record.get('url'), record.get('price_cut', 0.0))
+            for record in tracked_records
+        }
+        for record in self.posted_records:
+            key = (record.get('url'), record.get('price_cut', 0.0))
+            if key not in known_records:
+                tracked_records.append(record)
+                known_records.add(key)
+
+        with open(self.tracking_json, 'w') as tracking_file:
+            json.dump(tracked_records, tracking_file, indent=4)
+        self.tracking_info = tracked_records
+        print(str(self.tracking_json) + " updated!")
 
 class Game:
     def __init__(self, game_info=None, currency=None):
@@ -573,11 +620,168 @@ def run_dry_run(profile_info, profile_name, api_client=None):
     return bot
 
 
+def get_app_data_directory():
+    configured_directory = os.environ.get('FREEGAMESBOT_DATA_DIR')
+    if configured_directory:
+        directory = Path(configured_directory)
+    elif os.name == 'nt':
+        directory = Path(os.environ.get('LOCALAPPDATA', Path.home() / 'AppData' / 'Local')) / 'FreeGamesBot'
+    else:
+        directory = Path.home() / '.local' / 'share' / 'FreeGamesBot'
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def run_history_path():
+    return get_app_data_directory() / 'run-history.jsonl'
+
+
+def append_run_history(run_record):
+    with run_history_path().open('a', encoding='utf-8') as history_file:
+        history_file.write(json.dumps(run_record, ensure_ascii=True) + '\n')
+
+
+def acquire_profile_run_lock(profile_name):
+    lock_directory = get_app_data_directory() / 'run-locks'
+    lock_directory.mkdir(parents=True, exist_ok=True)
+    lock_name = hashlib.sha256(profile_name.encode('utf-8')).hexdigest() + '.lock'
+    lock_file = (lock_directory / lock_name).open('a+b')
+    lock_file.seek(0, os.SEEK_END)
+    if lock_file.tell() == 0:
+        lock_file.write(b'0')
+        lock_file.flush()
+    lock_file.seek(0)
+
+    try:
+        if os.name == 'nt':
+            import msvcrt
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock_file.close()
+        return None
+    return lock_file
+
+
+def release_profile_run_lock(lock_file):
+    try:
+        lock_file.seek(0)
+        if os.name == 'nt':
+            import msvcrt
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    finally:
+        lock_file.close()
+
+
+def _redact_run_error(error, profile_info):
+    message = "{}: {}".format(type(error).__name__, error)
+    secrets = [
+        profile_info.get('api_params', {}).get('key'),
+        profile_info.get('web_hook_address'),
+    ]
+    for secret in secrets:
+        if secret:
+            message = message.replace(secret, '[REDACTED]')
+    return message
+
+
+def run_profile(profile_info, profile_name):
+    started = datetime.now(timezone.utc)
+    start_time = time.monotonic()
+    run_record = {
+        'profile': profile_name,
+        'started_at': started.isoformat(timespec='seconds'),
+        'status': 'failed',
+        'candidates': 0,
+        'filtered': 0,
+        'duplicates': 0,
+        'eligible': 0,
+        'sent': 0,
+        'failed': 0,
+    }
+
+    lock_file = None
+    try:
+        lock_file = acquire_profile_run_lock(profile_name)
+        if lock_file is None:
+            run_record['status'] = 'skipped'
+            run_record['error'] = 'Another run for this profile is already active.'
+            print("{} Skipping duplicate profile run.".format(run_record['error']))
+        elif not validate_profiles({profile_name: profile_info}):
+            raise ValueError("Profile configuration is incomplete.")
+        else:
+            bot = Bot_Profile(profile_info, profile_name)
+            bot.get_games()
+            run_record['candidates'] = bot.candidate_count
+            run_record['filtered'] = bot.filtered_count
+            run_record['duplicates'] = bot.duplicate_count
+            run_record['eligible'] = len(bot.games)
+            bot.send_games()
+            run_record['sent'] = bot.sent_count
+            run_record['failed'] = bot.failed_count
+
+            if bot.sent_count:
+                bot.update_tracking_json()
+            run_record['status'] = 'partial' if bot.failed_count else 'success'
+    except Exception as error:
+        run_record['error'] = _redact_run_error(error, profile_info)
+        print("Run failed: {}".format(run_record['error']))
+    finally:
+        if lock_file is not None:
+            release_profile_run_lock(lock_file)
+        run_record['completed_at'] = datetime.now(timezone.utc).isoformat(timespec='seconds')
+        run_record['duration_seconds'] = round(time.monotonic() - start_time, 2)
+        try:
+            append_run_history(run_record)
+        except OSError as error:
+            print("Could not save run history ({}).".format(type(error).__name__))
+
+    print(
+        "Run '{}' {}: {} candidates, {} filtered, {} duplicates, {} eligible, {} sent, {} failed.".format(
+            profile_name,
+            run_record['status'],
+            run_record['candidates'],
+            run_record['filtered'],
+            run_record['duplicates'],
+            run_record['eligible'],
+            run_record['sent'],
+            run_record['failed'],
+        )
+    )
+    return run_record
+
+
+def run_webhook_test(profile_info, profile_name):
+    webhook_url = profile_info.get('web_hook_address', '')
+    message = "FreeGamesBot webhook test for '{}' at {}.".format(
+        profile_name,
+        datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z'),
+    )
+
+    if 'discord.com/api/webhooks/' in webhook_url:
+        sender = DiscordWebhookSender(webhook_url, content=message)
+    elif 'slack.com/services/' in webhook_url:
+        sender = SlackWebhooks(webhook_url, content=message)
+    else:
+        raise ValueError("Profile does not contain a supported Discord or Slack webhook URL.")
+
+    succeeded = sender.send()
+    print("Webhook test for '{}' {}.".format(profile_name, 'succeeded' if succeeded else 'failed'))
+    return succeeded
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Find deals and post them to configured webhooks.")
     diagnostic_modes = parser.add_mutually_exclusive_group()
     diagnostic_modes.add_argument("--check-api", metavar="PROFILE", help="Test ITAD connectivity without a webhook.")
     diagnostic_modes.add_argument("--dry-run", metavar="PROFILE", help="Fetch and filter deals without sending or saving.")
+    diagnostic_modes.add_argument("--run-profile", metavar="PROFILE", help="Run one configured profile and record its result.")
+    diagnostic_modes.add_argument("--test-webhook", metavar="PROFILE", help="Send one test message without fetching deals or updating tracking.")
     args = parser.parse_args(argv)
 
     print(
@@ -587,19 +791,26 @@ def main(argv=None):
     )
     settings = load_json_settings(settings_json)
 
-    if args.check_api or args.dry_run:
-        profile_name = args.check_api or args.dry_run
+    if args.check_api or args.dry_run or args.run_profile or args.test_webhook:
+        profile_name = args.check_api or args.dry_run or args.run_profile or args.test_webhook
         profile_info = settings.get(profile_name)
         if profile_info is None:
             print("Unknown profile '{}'.".format(profile_name))
             return 1
-        if not validate_profiles({profile_name: profile_info}, require_webhook=False):
-            return 1
         try:
+            if args.test_webhook:
+                return 0 if run_webhook_test(profile_info, profile_name) else 1
             if args.check_api:
+                if not validate_profiles({profile_name: profile_info}, require_webhook=False):
+                    return 1
                 run_api_check(profile_info, profile_name)
-            else:
+            elif args.dry_run:
+                if not validate_profiles({profile_name: profile_info}, require_webhook=False):
+                    return 1
                 run_dry_run(profile_info, profile_name)
+            else:
+                result = run_profile(profile_info, profile_name)
+                return 0 if result['status'] in ('success', 'partial') else 1
         except (ITADRequestError, OSError, ValueError, KeyError) as error:
             print("Diagnostic failed: {}".format(error))
             return 1
@@ -608,12 +819,8 @@ def main(argv=None):
     if not validate_profiles(settings):
         return 1
 
-    for profile in settings:
-        bot = Bot_Profile(settings[profile], profile)
-        bot.get_games()
-        bot.send_games()
-        bot.update_tracking_json()
-    return 0
+    results = [run_profile(settings[profile], profile) for profile in settings]
+    return 1 if any(result['status'] == 'failed' for result in results) else 0
 
 '''*******************************************************************
 ************************** Main Function!!! **************************
