@@ -1,2 +1,13 @@
+# Workspace and virtual environment
 /freegamesBot.code-workspace
 /.venv
+
+# Python cache and compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pycache/
+
+# Webhooks and api settings
+**/settings.json

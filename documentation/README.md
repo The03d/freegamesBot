@@ -4,14 +4,36 @@ A WebHook bot that finds free games on IsThereAnyDeal.com using it's API and pos
 Make sure you have [Python 3](https://www.python.org/downloads/windows/) installed, and download the code to your machine. <br />
 
 Install the needed libraries using [pip](https://pypi.org/project/pip/):<br /> 
-* `py -m pip install requests`<br />
-* `py -m pip install Discord-Webhooks`<br />
+* `py -m pip install -r requirements.txt`<br />
 
 Consult the [pip documentation](https://pip.pypa.io/en/stable/) for further detail.
 
 Create an "app" to get an API Key from [IsThereAnyDeal](https://isthereanydeal.com/apps/).  The API is [well documented](https://itad.docs.apiary.io/#).  Add the API key you get to the `settings.json` under `Bot_Name['api_params']['key']`. <br />
 
 [Get a Discord webhook set up on your server](https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks) and add the url you receive to the `settings.json` . <br />
+
+## Testing
+Run the offline component tests from the project root. They use mocked HTTP requests and do not contact ITAD, Discord, or Slack:
+
+```powershell
+py -m unittest discover -s tests -v
+```
+
+To check the ITAD API for one configured profile without setting up a webhook:
+
+```powershell
+py src\free_games_bot.py --check-api Bot_Name
+```
+
+This requires that profile's ITAD API key. It checks the store list when needed by the shop filter and then requests deals. It does not send webhooks or create/update tracking files.
+
+To fetch and filter real deals without posting or saving tracking state:
+
+```powershell
+py src\free_games_bot.py --dry-run Bot_Name
+```
+
+The dry run reads an existing tracking file if present, prints a summary and up to five eligible games, and does not create or modify tracking files. Running the script without either diagnostic option is the production flow: it can post to configured webhooks and update tracking files.
 
 ## Recommended:
 You can also optionally use [Task Scheduler](https://docs.microsoft.com/en-us/windows/win32/taskschd/task-scheduler-start-page) in Windows to run this script as often as you like. <br />
