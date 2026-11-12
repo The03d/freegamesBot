@@ -65,7 +65,7 @@ class DesktopAppTests(unittest.TestCase):
             app.status_var = Mock()
             settings = {'Example': build_profile(self.profile_values())}
             FreeGamesBotApp._save_profiles(app, settings, 'Example')
-            self.assertEqual(json.loads((Path(temp_dir) / 'settings.json').read_text(encoding='utf-8')), settings)
+            self.assertEqual(json.loads((Path(temp_dir) / 'data' / 'settings.json').read_text(encoding='utf-8')), settings)
             self.assertEqual(app.settings, settings)
             app._refresh_profile_menu.assert_called_once_with('Example')
 
@@ -102,7 +102,8 @@ class DesktopAppTests(unittest.TestCase):
                 patch.object(FreeGamesBotApp, '_read_schedules', return_value={}), \
                 patch.object(FreeGamesBotApp, '_refresh_all'), \
                 patch('src.free_games_bot_ui.messagebox.askyesno', return_value=True):
-            settings_path = Path(temp_dir) / 'settings.json'
+            settings_path = Path(temp_dir) / 'data' / 'settings.json'
+            settings_path.parent.mkdir()
             settings_path.write_text('{}', encoding='utf-8')
             try:
                 app = FreeGamesBotApp()

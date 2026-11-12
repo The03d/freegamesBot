@@ -8,9 +8,11 @@ Install the needed libraries using [pip](https://pypi.org/project/pip/):<br />
 
 Consult the [pip documentation](https://pip.pypa.io/en/stable/) for further detail.
 
-Create an "app" to get an API Key from [IsThereAnyDeal](https://isthereanydeal.com/apps/).  The API is [well documented](https://itad.docs.apiary.io/#).  Add the API key you get to the `settings.json` under `Bot_Name['api_params']['key']`. <br />
+Create an "app" to get an API Key from [IsThereAnyDeal](https://isthereanydeal.com/apps/).  The API is [well documented](https://itad.docs.apiary.io/#).  Add the API key you get to `data/settings.json` under `Bot_Name['api_params']['key']`. <br />
 
 [Get a Discord webhook set up on your server](https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks) and add the url you receive to the `settings.json` . <br />
+
+Settings and bare tracking filenames are stored in the project's `data` folder. On normal startup, existing root-level settings and posted-game files are migrated without overwriting conflicting files. Diagnostics read legacy files without moving them. Explicit absolute tracking paths are unchanged; relative paths containing directories are resolved from the project root. Back up `data` together with the separate app-data queue database described below. The `data` folder is Git-ignored, but its settings are not encrypted.
 
 ## Testing
 Run the offline component tests from the project root. They use mocked HTTP requests and do not contact ITAD, Discord, or Slack:

@@ -15,9 +15,9 @@ import tkinter.messagebox as messagebox
 import customtkinter as ctk
 
 try:
-    from .free_games_bot import DeliveryState, acquire_profile_run_lock, get_app_data_directory, release_profile_run_lock, run_history_path
+    from .free_games_bot import DeliveryState, acquire_profile_run_lock, get_app_data_directory, migrate_project_data, project_settings_path, release_profile_run_lock, run_history_path
 except ImportError:
-    from free_games_bot import DeliveryState, acquire_profile_run_lock, get_app_data_directory, release_profile_run_lock, run_history_path
+    from free_games_bot import DeliveryState, acquire_profile_run_lock, get_app_data_directory, migrate_project_data, project_settings_path, release_profile_run_lock, run_history_path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -388,8 +388,9 @@ class FreeGamesBotApp(ctk.CTk):
         self._frequency_changed(self.frequency_var.get())
 
     def _load_profiles(self):
-        settings_path = PROJECT_ROOT / 'settings.json'
         try:
+            migrate_project_data(PROJECT_ROOT)
+            settings_path = project_settings_path(PROJECT_ROOT)
             self.settings = json.loads(settings_path.read_text(encoding='utf-8'))
             if not isinstance(self.settings, dict):
                 raise ValueError('Settings must contain a profile object.')
@@ -409,7 +410,8 @@ class FreeGamesBotApp(ctk.CTk):
         self.profile_var.set(selected if selected is not None and selected in profiles else (profiles[0] if profiles else 'No profiles'))
 
     def _save_profiles(self, settings, selected=None):
-        settings_path = PROJECT_ROOT / 'settings.json'
+        settings_path = project_settings_path(PROJECT_ROOT)
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = settings_path.with_suffix('.json.tmp')
         temporary.write_text(json.dumps(settings, indent=4) + '\n', encoding='utf-8')
         temporary.replace(settings_path)

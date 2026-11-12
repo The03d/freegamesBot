@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,12 +14,140 @@ from src.free_games_bot import (
     Game,
     ITADClient,
     ITADRequestError,
+    acquire_profile_run_lock,
+    release_profile_run_lock,
     run_profile,
     manage_uncertain_deliveries,
+    main,
     resolve_shops,
     run_api_check,
+    resolve_tracking_path,
+    migrate_project_data,
     validate_profiles,
 )
+
+
+class ProjectDataPathTests(unittest.TestCase):
+    def test_tracking_paths_are_anchored_and_absolute_paths_are_preserved(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.assertEqual(resolve_tracking_path('posted.json', root), root / 'data' / 'posted.json')
+            self.assertEqual(resolve_tracking_path('custom/posted.json', root), root / 'custom' / 'posted.json')
+            absolute = root / 'external' / 'posted.json'
+            self.assertEqual(resolve_tracking_path(str(absolute), root), absolute)
+            (root / 'posted.json').write_text('[]', encoding='utf-8')
+            self.assertEqual(resolve_tracking_path('posted.json', root, allow_legacy=True), root / 'posted.json')
+
+    def test_tracking_path_rejects_conflicting_copies(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / 'data').mkdir()
+            (root / 'posted.json').write_text('[1]', encoding='utf-8')
+            (root / 'data' / 'posted.json').write_text('[2]', encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'Conflicting tracking files'):
+                resolve_tracking_path('posted.json', root, allow_legacy=True)
+
+    def test_migration_preserves_settings_and_tracking_bytes(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict('os.environ', {'FREEGAMESBOT_DATA_DIR': temp_dir}):
+            root = Path(temp_dir) / 'project'
+            root.mkdir()
+            settings = b'{"Example": {"tracking_json": "posted_example.json"}}\n'
+            tracking = b'[{"title": "Existing"}]\n'
+            (root / 'settings.json').write_bytes(settings)
+            (root / 'posted_example.json').write_bytes(tracking)
+            migrate_project_data(root)
+            self.assertEqual((root / 'data' / 'settings.json').read_bytes(), settings)
+            self.assertEqual((root / 'data' / 'posted_example.json').read_bytes(), tracking)
+            self.assertFalse((root / 'settings.json').exists())
+            self.assertFalse((root / 'posted_example.json').exists())
+            migrate_project_data(root)
+
+    def test_migration_conflict_does_not_modify_either_copy(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict('os.environ', {'FREEGAMESBOT_DATA_DIR': temp_dir}):
+            root = Path(temp_dir) / 'project'
+            (root / 'data').mkdir(parents=True)
+            (root / 'settings.json').write_text('{}', encoding='utf-8')
+            (root / 'posted_example.json').write_text('[1]', encoding='utf-8')
+            (root / 'data' / 'posted_example.json').write_text('[2]', encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'Conflicting project data'):
+                migrate_project_data(root)
+            self.assertEqual((root / 'posted_example.json').read_text(), '[1]')
+            self.assertEqual((root / 'data' / 'posted_example.json').read_text(), '[2]')
+            self.assertFalse((root / 'data' / 'settings.json').exists())
+
+    def test_interrupted_migration_can_resume_without_losing_records(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict('os.environ', {'FREEGAMESBOT_DATA_DIR': temp_dir}):
+            root = Path(temp_dir) / 'project'
+            (root / 'data').mkdir(parents=True)
+            (root / 'settings.json').write_text('{"Test": {"tracking_json": "posted_test.json"}}')
+            (root / 'posted_test.json').write_text('[1]')
+            (root / 'data' / 'posted_test.json').write_text('[1]')
+            migrate_project_data(root)
+            self.assertEqual((root / 'data' / 'posted_test.json').read_text(), '[1]')
+            self.assertFalse((root / 'posted_test.json').exists())
+            self.assertFalse((root / 'settings.json').exists())
+
+    def test_malformed_settings_and_active_profile_prevent_migration(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict('os.environ', {'FREEGAMESBOT_DATA_DIR': temp_dir}):
+            root = Path(temp_dir) / 'project'
+            root.mkdir()
+            settings_path = root / 'settings.json'
+            settings_path.write_text('{invalid')
+            with self.assertRaises(json.JSONDecodeError):
+                migrate_project_data(root)
+            self.assertFalse((root / 'data').exists())
+            settings_path.write_text('{"Test": {"tracking_json": "posted_test.json"}}')
+            lock_file = acquire_profile_run_lock('Test')
+            try:
+                with self.assertRaisesRegex(ValueError, 'profile is running'):
+                    migrate_project_data(root)
+            finally:
+                release_profile_run_lock(lock_file)
+            self.assertTrue(settings_path.exists())
+            self.assertFalse((root / 'data').exists())
+
+    def test_completed_migration_does_not_block_on_running_profile(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict('os.environ', {'FREEGAMESBOT_DATA_DIR': temp_dir}):
+            root = Path(temp_dir) / 'project'
+            (root / 'data').mkdir(parents=True)
+            (root / 'data' / 'settings.json').write_text('{"Test": {}}')
+            lock_file = acquire_profile_run_lock('Test')
+            try:
+                migrate_project_data(root)
+            finally:
+                release_profile_run_lock(lock_file)
+
+    def test_absolute_tracking_file_in_project_root_is_not_moved(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict('os.environ', {'FREEGAMESBOT_DATA_DIR': temp_dir}):
+            root = Path(temp_dir) / 'project'
+            root.mkdir()
+            tracking = root / 'posted_external.json'
+            tracking.write_text('[]')
+            (root / 'settings.json').write_text(json.dumps({'Test': {'tracking_json': str(tracking)}}))
+            migrate_project_data(root)
+            self.assertTrue(tracking.exists())
+            self.assertFalse((root / 'data' / tracking.name).exists())
+
+    def test_diagnostics_read_legacy_files_without_migrating_from_another_cwd(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / 'project'
+            root.mkdir()
+            settings_path = root / 'settings.json'
+            settings_path.write_text(json.dumps({'Test': {'api_params': {'key': 'test'}}}))
+            original_cwd = Path.cwd()
+            try:
+                os.chdir(temp_dir)
+                with patch('src.free_games_bot.PROJECT_ROOT', root), \
+                        patch('src.free_games_bot.run_api_check') as check, \
+                        patch('src.free_games_bot.run_dry_run') as dry_run:
+                    self.assertEqual(main(['--check-api', 'Test']), 0)
+                    self.assertEqual(main(['--dry-run', 'Test']), 0)
+                check.assert_called_once()
+                dry_run.assert_called_once()
+            finally:
+                os.chdir(original_cwd)
+            self.assertTrue(settings_path.exists())
+            self.assertFalse((root / 'data').exists())
 
 
 class DeliveryStateTests(unittest.TestCase):

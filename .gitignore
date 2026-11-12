@@ -11,6 +11,7 @@ __pycache__/
 
 # Webhooks and api settings
 **/settings.json
+/data/
 
 # Tracking JSON files for posted games
 **/posted_*.json

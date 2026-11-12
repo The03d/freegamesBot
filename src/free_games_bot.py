@@ -20,6 +20,39 @@ try:
 except ImportError:
     from delivery_state import DeliveryState
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def project_data_directory(project_root=None):
+    return Path(project_root if project_root is not None else PROJECT_ROOT) / 'data'
+
+
+def project_settings_path(project_root=None, allow_legacy=False):
+    root = Path(project_root if project_root is not None else PROJECT_ROOT)
+    current = project_data_directory(root) / 'settings.json'
+    legacy = root / 'settings.json'
+    if current.exists() and legacy.exists() and current.read_bytes() != legacy.read_bytes():
+        raise ValueError('Conflicting settings files: {} and {}'.format(legacy, current))
+    if allow_legacy and not current.exists() and legacy.exists():
+        return legacy
+    return current
+
+
+def resolve_tracking_path(value, project_root=None, allow_legacy=False):
+    root = Path(project_root if project_root is not None else PROJECT_ROOT)
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    if path.parent != Path('.'):
+        return root / path
+    current = project_data_directory(root) / path
+    legacy = root / path
+    if current.exists() and legacy.exists() and current.read_bytes() != legacy.read_bytes():
+        raise ValueError('Conflicting tracking files: {} and {}'.format(legacy, current))
+    if allow_legacy and not current.exists() and legacy.exists():
+        return legacy
+    return current
+
 '''*******************************************************************
 ******************** Custom Webhooks Classes!!! **********************
 *******************************************************************'''
@@ -389,7 +422,7 @@ class Bot_Profile:
 
             self.games = []
 
-            self.tracking_json = profile_info.get('tracking_json', '')
+            self.tracking_json = resolve_tracking_path(profile_info.get('tracking_json', ''), allow_legacy=read_only)
             self.tracking_info = self.load_tracking_info(create_if_missing=not read_only)
 
         self.session_info = []
@@ -430,6 +463,7 @@ class Bot_Profile:
         except FileNotFoundError:
             if not create_if_missing:
                 return []
+            Path(self.tracking_json).parent.mkdir(parents=True, exist_ok=True)
             with open(self.tracking_json, 'w') as tracking_file:
                 json.dump([], tracking_file)
             print("...............Tracking JSON created.\n")
@@ -615,19 +649,20 @@ default_settings = json.dumps( {
             "tracking_json" : "posted_default.json"
   } }, sort_keys=True, indent=4 )
 
-settings_json = "settings.json"
-
-## try to read the settings JSON
-def load_json_settings( json_file ):
-    settings = {}
+def load_json_settings(json_file, create_if_missing=True):
+    path = Path(json_file)
     try:
-        settings = json.loads(open(json_file, 'r').read())
+        settings = json.loads(path.read_text(encoding='utf-8'))
+        if not isinstance(settings, dict):
+            raise ValueError('Settings must contain a profile object.')
         print( "...............JSON settings loaded.\n" )
-    except:
+    except FileNotFoundError:
+        if not create_if_missing:
+            raise
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('x', encoding='utf-8') as settings_file:
+            settings_file.write(default_settings)
         settings = json.loads(default_settings)
-        f = open("settings.json", "x")
-        f.write( default_settings )
-        f.close
         print( "...............DEFAULT settings JSON created.\n" )
 
     return settings
@@ -739,6 +774,88 @@ def release_profile_run_lock(lock_file):
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
     finally:
         lock_file.close()
+
+
+def migrate_project_data(project_root=None):
+    root = Path(project_root if project_root is not None else PROJECT_ROOT)
+    data_directory = project_data_directory(root)
+    migration_lock = acquire_profile_run_lock('__project_data_migration__:' + str(root.resolve()))
+    if migration_lock is None:
+        raise ValueError('Project data migration is already running.')
+    profile_locks = []
+    try:
+        legacy_settings = root / 'settings.json'
+        new_settings = data_directory / 'settings.json'
+        if legacy_settings.exists() and new_settings.exists() and legacy_settings.read_bytes() != new_settings.read_bytes():
+            raise ValueError('Conflicting settings files: {} and {}'.format(legacy_settings, new_settings))
+        settings_path = new_settings if new_settings.exists() else legacy_settings
+        settings = {}
+        settings_content = None
+        if settings_path.exists():
+            settings_content = settings_path.read_bytes()
+            settings = json.loads(settings_content)
+            if not isinstance(settings, dict) or not all(isinstance(profile, dict) for profile in settings.values()):
+                raise ValueError('Settings must contain a profile object.')
+
+        sources = set(root.glob('posted_*.json'))
+        absolute_paths = set()
+        bare_paths = set()
+        for profile in settings.values():
+            tracking = profile.get('tracking_json')
+            if tracking:
+                path = Path(tracking)
+                if path.is_absolute():
+                    absolute_paths.add(path)
+                elif path.parent == Path('.'):
+                    bare_paths.add(root / path)
+        if absolute_paths & bare_paths:
+            raise ValueError('A tracking file is shared by absolute and bare paths; resolve it before migration.')
+        sources = (sources | bare_paths) - absolute_paths
+        if legacy_settings.exists():
+            sources.add(legacy_settings)
+        sources = {path for path in sources if path.is_file()}
+        if not sources:
+            return
+
+        for state_id in sorted({profile.get('state_id', name) for name, profile in settings.items()}):
+            lock_file = acquire_profile_run_lock(state_id)
+            if lock_file is None:
+                raise ValueError('A profile is running; retry project data migration after it finishes.')
+            profile_locks.append(lock_file)
+        if settings_content is not None and settings_path.read_bytes() != settings_content:
+            raise ValueError('Settings changed during project data migration.')
+        snapshots = {path: path.read_bytes() for path in sources}
+        for source, content in snapshots.items():
+            destination = data_directory / source.name
+            if destination.exists() and destination.read_bytes() != content:
+                raise ValueError('Conflicting project data files: {} and {}'.format(source, destination))
+
+        if snapshots:
+            data_directory.mkdir(parents=True, exist_ok=True)
+        for source in sorted(snapshots, key=lambda path: path.name == 'settings.json'):
+            destination = data_directory / source.name
+            content = snapshots[source]
+            if source.read_bytes() != content:
+                raise ValueError('Project data changed during migration: {}'.format(source))
+            if not destination.exists():
+                try:
+                    with destination.open('xb') as target:
+                        target.write(content)
+                        target.flush()
+                        os.fsync(target.fileno())
+                except FileExistsError:
+                    pass
+            if destination.read_bytes() != content:
+                raise ValueError('Could not verify migrated project data: {}'.format(destination))
+        for source, content in snapshots.items():
+            if source.read_bytes() != content:
+                raise ValueError('Project data changed during migration: {}'.format(source))
+        for source in snapshots:
+            source.unlink()
+    finally:
+        for lock_file in reversed(profile_locks):
+            release_profile_run_lock(lock_file)
+        release_profile_run_lock(migration_lock)
 
 
 def _redact_run_error(error, profile_info):
@@ -988,7 +1105,15 @@ def main(argv=None):
         "************************ STARTING ITAD BOTS ************************\n"
         "********************************************************************"
     )
-    settings = load_json_settings(settings_json)
+    try:
+        diagnostic = bool(args.check_api or args.dry_run)
+        if not diagnostic:
+            migrate_project_data()
+        settings_path = project_settings_path(allow_legacy=diagnostic)
+        settings = load_json_settings(settings_path, create_if_missing=not diagnostic)
+    except (OSError, ValueError) as error:
+        print('Settings unavailable ({}): {}'.format(type(error).__name__, error))
+        return 1
 
     if args.check_api or args.dry_run or args.run_profile or args.test_webhook or args.list_uncertain or args.resolve_uncertain:
         profile_name = args.check_api or args.dry_run or args.run_profile or args.test_webhook or args.list_uncertain or args.resolve_uncertain
