@@ -1,4 +1,4 @@
-# FGF-Bot
+# Free Games Bot
 A WebHook bot that finds free games on IsThereAnyDeal.com using it's API and posts it directly to your [Discord](https://discord.com/) or [Slack](https://slack.com/) server in a particular channel <br />
 ## Instructions:
 Make sure you have [Python 3](https://www.python.org/downloads/windows/) installed, and download the code to your machine. <br />
@@ -8,7 +8,7 @@ Install the needed libraries using [pip](https://pypi.org/project/pip/):<br />
 
 Consult the [pip documentation](https://pip.pypa.io/en/stable/) for further detail.
 
-Create an "app" to get an API Key from [IsThereAnyDeal](https://isthereanydeal.com/apps/).  The API is [well documented](https://itad.docs.apiary.io/#).  Add the API key you get to `data/settings.json` under `Bot_Name['api_params']['key']`. <br />
+Create an "app" to get an API Key from [IsThereAnyDeal](https://isthereanydeal.com/apps/).  The API is [well documented](https://docs.isthereanydeal.com/).  Add the API key you get to `data/settings.json` under `Bot_Name['api_params']['key']`. <br />
 
 [Get a Discord webhook set up on your server](https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks) and add the url you receive to the `settings.json` . <br />
 

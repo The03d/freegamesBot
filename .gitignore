@@ -15,3 +15,6 @@ __pycache__/
 
 # Tracking JSON files for posted games
 **/posted_*.json
+
+# Agent instructions
+**/AGENTS.md
