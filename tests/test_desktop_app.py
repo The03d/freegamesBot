@@ -15,7 +15,7 @@ from src.free_games_bot_ui import FreeGamesBotApp, ProfileManager, build_profile
 class DesktopAppTests(unittest.TestCase):
     def profile_values(self):
         return {
-            'name': 'Example', 'key': 'key', 'country': 'CA', 'sort': '-cut', 'region': '',
+            'name': 'Example', 'key': 'key', 'country': 'CA', 'sort': '-cut',
             'limit': '4000', 'max_posts_per_day': '10', 'offset': '', 'nondeals': False, 'mature': False,
             'web_hook_address': 'https://example.test', 'tracking_json': 'posted.json',
             'shops': 'Steam, 42', 'store_mode': 'Include', 'min_discount_percent': '',
@@ -23,10 +23,10 @@ class DesktopAppTests(unittest.TestCase):
             'include_keywords': 'puzzle',
         }
 
-    def test_build_profile_preserves_extra_settings_and_moves_legacy_keywords(self):
+    def test_build_profile_preserves_extra_settings(self):
         existing = {
             'api_params': {'extra': 'kept'},
-            'store_filter': {'exclude': ['itchio'], 'exclude_keywords': 'demo'},
+            'store_filter': {'exclude': ['itchio']},
             'game_filters': {'extra_filter': 7},
             'extra': True,
         }
@@ -37,7 +37,7 @@ class DesktopAppTests(unittest.TestCase):
         self.assertEqual(result['game_filters']['extra_filter'], 7)
         self.assertEqual(result['api_params']['extra'], 'kept')
         self.assertTrue(result['extra'])
-        self.assertIn('exclude_keywords', existing['store_filter'])
+        self.assertEqual(existing['store_filter'], {'exclude': ['itchio']})
 
     def test_build_profile_rejects_invalid_values(self):
         for key, value in (('limit', '0'), ('max_posts_per_day', '0'), ('offset', '-1'), ('max_price_new', 'nan'),
@@ -78,7 +78,9 @@ class DesktopAppTests(unittest.TestCase):
     def test_invalid_settings_cannot_be_overwritten_by_manager(self):
         with tempfile.TemporaryDirectory() as temp_dir, patch('src.free_games_bot_ui.PROJECT_ROOT', Path(temp_dir)), \
                 patch('src.free_games_bot_ui.messagebox.showerror'):
-            (Path(temp_dir) / 'settings.json').write_text('{invalid', encoding='utf-8')
+            settings_path = Path(temp_dir) / 'data' / 'settings.json'
+            settings_path.parent.mkdir()
+            settings_path.write_text('{invalid', encoding='utf-8')
             app = Mock(spec=FreeGamesBotApp)
             FreeGamesBotApp._load_profiles(app)
             self.assertFalse(app.settings_loaded)
@@ -97,7 +99,6 @@ class DesktopAppTests(unittest.TestCase):
     def test_profile_manager_create_edit_rename_and_remove(self):
         with tempfile.TemporaryDirectory() as temp_dir, \
                 patch('src.free_games_bot_ui.PROJECT_ROOT', Path(temp_dir)), \
-            patch.object(FreeGamesBotApp, '_remove_legacy_scheduled_tasks'), \
                 patch.object(FreeGamesBotApp, '_read_schedules', return_value={}), \
                 patch.object(FreeGamesBotApp, '_refresh_all'), \
                 patch('src.free_games_bot_ui.messagebox.askyesno', return_value=True):
@@ -171,20 +172,6 @@ class DesktopAppTests(unittest.TestCase):
             expected_log_path = Path(temp_dir) / 'data' / ('scheduled-' + app._profile_slug(profile) + '.log')
             self.assertIn(repr(str(expected_log_path)), source)
             self.assertNotEqual(launcher.suffix, '.cmd')
-
-    def test_legacy_task_cleanup_removes_only_unversioned_tasks_once(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            marker = Path(temp_dir) / 'data' / 'legacy-tasks-cleaned-v2'
-            query_result = Mock(returncode=0, stdout='"\\FreeGamesBot-Old","Ready"\n"\\FreeGamesBot-v2-New","Ready"\n"\\Other","Ready"\n', stderr='')
-            delete_result = Mock(returncode=0, stdout='', stderr='')
-            with patch('src.free_games_bot_ui.LEGACY_TASK_CLEANUP_MARKER', marker), \
-                    patch('src.free_games_bot_ui.subprocess.run', side_effect=[query_result, delete_result]) as run:
-                FreeGamesBotApp._remove_legacy_scheduled_tasks()
-                FreeGamesBotApp._remove_legacy_scheduled_tasks()
-
-            self.assertEqual(run.call_count, 2)
-            self.assertEqual(run.call_args_list[1].args[0][-1], '\\FreeGamesBot-Old')
-            self.assertTrue(marker.exists())
 
     def test_next_run_calculates_daily_and_weekly_times(self):
         now = datetime(2026, 11, 11, 13, 30)

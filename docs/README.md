@@ -12,7 +12,7 @@ Create an "app" to get an API Key from [IsThereAnyDeal](https://isthereanydeal.c
 
 [Get a Discord webhook set up on your server](https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks) and add the url you receive to the `settings.json` . <br />
 
-Settings, tracking files, delivery state, run history, locks, schedules, launcher scripts, and scheduled-task logs are stored in the project's `data` folder. Startup migrates eligible legacy root-level settings and tracking files into `data` without overwriting conflicting files. Tracking paths must be relative to `data` and cannot escape it. Existing AppData files are not imported; legacy `FreeGamesBot-*` scheduled tasks are removed once when the dashboard starts. The `data` folder is Git-ignored, but its settings are not encrypted.
+Settings, tracking files, delivery state, run history, locks, schedules, launcher scripts, and scheduled-task logs are stored in the project's `data` folder. Tracking paths must be relative to `data` and cannot escape it. The `data` folder is Git-ignored, but its settings are not encrypted.
 
 ## Testing
 Run the offline component tests from the project root. They use mocked HTTP requests and do not contact ITAD, Discord, or Slack:
@@ -49,7 +49,7 @@ py src\free_games_bot_ui.py
 
 Select a profile and use **Test Webhook** to send one timestamped probe without fetching deals or changing tracking. **Run Profile** executes that profile's normal deal workflow. The dashboard can also create or remove daily and weekly Windows Task Scheduler jobs for the selected profile; scheduled tasks continue to run when the dashboard is closed.
 
-Use **Manage Profiles** to add, edit, rename, or remove profiles. Leave the deal limit blank to search all available pages, and set the maximum posts per day for each profile. Remove a profile's scheduled task before renaming or deleting it. Removing a profile retains its tracking file, queue and daily state; recreating it with the same name restores that state. Saving a profile moves legacy `store_filter.exclude_keywords` settings into `game_filters`.
+Use **Manage Profiles** to add, edit, rename, or remove profiles. Leave the deal limit blank to search all available pages, and set the maximum posts per day for each profile. Remove a profile's scheduled task before renaming or deleting it. Removing a profile retains its tracking file, queue and daily state; recreating it with the same name restores that state.
 
 Each profile defaults to 10 deal posts per local calendar day across all its runs. Profiles using the same webhook have separate limits. The allowance resets at local midnight, but queued deals are only sent when the profile next runs. Existing tracking files do not contain posting dates, so the daily count starts with the new delivery ledger.
 

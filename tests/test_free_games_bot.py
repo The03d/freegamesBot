@@ -21,8 +21,8 @@ from src.free_games_bot import (
     main,
     resolve_shops,
     run_api_check,
+    project_settings_path,
     resolve_tracking_path,
-    migrate_project_data,
     delivery_state_path,
     run_history_path,
     validate_profiles,
@@ -48,120 +48,20 @@ class ProjectDataPathTests(unittest.TestCase):
             finally:
                 release_profile_run_lock(lock_file)
 
-    def test_migration_preserves_nested_tracking_subdirectories(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir) / 'project'
-            tracking = root / 'custom' / 'posted.json'
-            tracking.parent.mkdir(parents=True)
-            tracking.write_text('[]', encoding='utf-8')
-            (root / 'settings.json').write_text(
-                json.dumps({'Test': {'tracking_json': 'custom/posted.json'}}), encoding='utf-8'
-            )
-
-            migrate_project_data(root)
-
-            self.assertEqual((root / 'data' / 'custom' / 'posted.json').read_text(encoding='utf-8'), '[]')
-            self.assertFalse(tracking.exists())
-
-    def test_tracking_path_rejects_conflicting_copies(self):
+    def test_settings_path_uses_project_data(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            (root / 'data').mkdir()
-            (root / 'posted.json').write_text('[1]', encoding='utf-8')
-            (root / 'data' / 'posted.json').write_text('[2]', encoding='utf-8')
-            (root / 'settings.json').write_text(
-                json.dumps({'Test': {'tracking_json': 'posted.json'}}), encoding='utf-8'
-            )
-            with self.assertRaisesRegex(ValueError, 'Conflicting project data'):
-                migrate_project_data(root)
-
-    def test_migration_preserves_settings_and_tracking_bytes(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir) / 'project'
-            root.mkdir()
-            settings = b'{"Example": {"tracking_json": "posted_example.json"}}\n'
-            tracking = b'[{"title": "Existing"}]\n'
-            (root / 'settings.json').write_bytes(settings)
-            (root / 'posted_example.json').write_bytes(tracking)
-            migrate_project_data(root)
-            self.assertEqual((root / 'data' / 'settings.json').read_bytes(), settings)
-            self.assertEqual((root / 'data' / 'posted_example.json').read_bytes(), tracking)
-            self.assertFalse((root / 'settings.json').exists())
-            self.assertFalse((root / 'posted_example.json').exists())
-            migrate_project_data(root)
-
-    def test_migration_conflict_does_not_modify_either_copy(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir) / 'project'
-            (root / 'data').mkdir(parents=True)
             (root / 'settings.json').write_text('{}', encoding='utf-8')
-            (root / 'posted_example.json').write_text('[1]', encoding='utf-8')
-            (root / 'data' / 'posted_example.json').write_text('[2]', encoding='utf-8')
-            with self.assertRaisesRegex(ValueError, 'Conflicting project data'):
-                migrate_project_data(root)
-            self.assertEqual((root / 'posted_example.json').read_text(), '[1]')
-            self.assertEqual((root / 'data' / 'posted_example.json').read_text(), '[2]')
-            self.assertFalse((root / 'data' / 'settings.json').exists())
+            expected = root / 'data' / 'settings.json'
+            expected.parent.mkdir()
+            expected.write_text('{"current": true}', encoding='utf-8')
+            self.assertEqual(project_settings_path(root), expected)
 
-    def test_interrupted_migration_can_resume_without_losing_records(self):
+    def test_diagnostics_read_project_settings_from_data_from_another_cwd(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / 'project'
-            (root / 'data').mkdir(parents=True)
-            (root / 'settings.json').write_text('{"Test": {"tracking_json": "posted_test.json"}}')
-            (root / 'posted_test.json').write_text('[1]')
-            (root / 'data' / 'posted_test.json').write_text('[1]')
-            migrate_project_data(root)
-            self.assertEqual((root / 'data' / 'posted_test.json').read_text(), '[1]')
-            self.assertFalse((root / 'posted_test.json').exists())
-            self.assertFalse((root / 'settings.json').exists())
-
-    def test_malformed_settings_and_active_profile_prevent_migration(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir) / 'project'
-            root.mkdir()
-            settings_path = root / 'settings.json'
-            settings_path.write_text('{invalid')
-            with self.assertRaises(json.JSONDecodeError):
-                migrate_project_data(root)
-            self.assertFalse((root / 'data' / 'settings.json').exists())
-            settings_path.write_text('{"Test": {"tracking_json": "posted_test.json"}}')
-            lock_file = acquire_profile_run_lock('Test', root)
-            try:
-                with self.assertRaisesRegex(ValueError, 'profile is running'):
-                    migrate_project_data(root)
-            finally:
-                release_profile_run_lock(lock_file)
-            self.assertTrue(settings_path.exists())
-            self.assertFalse((root / 'data' / 'settings.json').exists())
-
-    def test_completed_migration_does_not_block_on_running_profile(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir) / 'project'
-            (root / 'data').mkdir(parents=True)
-            (root / 'data' / 'settings.json').write_text('{"Test": {}}')
-            lock_file = acquire_profile_run_lock('Test', root)
-            try:
-                migrate_project_data(root)
-            finally:
-                release_profile_run_lock(lock_file)
-
-    def test_absolute_tracking_path_is_not_migrated_and_is_rejected_at_use(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir) / 'project'
-            root.mkdir()
-            tracking = Path(temp_dir) / 'outside' / 'posted_external.json'
-            (root / 'settings.json').write_text(json.dumps({'Test': {'tracking_json': str(tracking)}}))
-            migrate_project_data(root)
-            with self.assertRaisesRegex(ValueError, 'relative path'):
-                resolve_tracking_path(str(tracking), root)
-            self.assertFalse(tracking.exists())
-            self.assertTrue((root / 'data' / 'settings.json').exists())
-
-    def test_diagnostics_migrate_legacy_files_from_another_cwd(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir) / 'project'
-            root.mkdir()
-            settings_path = root / 'settings.json'
+            settings_path = root / 'data' / 'settings.json'
+            settings_path.parent.mkdir(parents=True)
             settings_path.write_text(json.dumps({'Test': {'api_params': {'key': 'test'}}}))
             original_cwd = Path.cwd()
             try:
@@ -175,8 +75,8 @@ class ProjectDataPathTests(unittest.TestCase):
                 dry_run.assert_called_once()
             finally:
                 os.chdir(original_cwd)
-            self.assertFalse(settings_path.exists())
-            self.assertTrue((root / 'data' / 'settings.json').exists())
+            self.assertTrue(settings_path.exists())
+            self.assertEqual(json.loads(settings_path.read_text()), {'Test': {'api_params': {'key': 'test'}}})
 
 
 class DeliveryStateTests(unittest.TestCase):
@@ -410,7 +310,7 @@ class ITADClientTests(unittest.TestCase):
         response.raise_for_status.assert_called_once_with()
 
     @patch('src.free_games_bot.requests.get')
-    def test_get_deals_paginates_and_normalizes_legacy_parameters(self, get):
+    def test_get_deals_paginates_with_current_parameters(self, get):
         first_page = Mock()
         first_page.json.return_value = {
             'nextOffset': 210,
@@ -430,9 +330,8 @@ class ITADClientTests(unittest.TestCase):
             'country': 'CA',
             'offset': 10,
             'limit': 201,
-            'region': '',
             'shops': '35,61',
-            'sort': 'cut:desc',
+            'sort': '-cut',
         })
 
         self.assertEqual(len(deals), 201)
@@ -569,11 +468,8 @@ class ProfileDiagnosticTests(unittest.TestCase):
         return {
             'api_params': {'key': 'test-key', 'limit': 10, 'shops': ''},
             'web_hook_address': '',
-            'store_filter': {
-                'include': ['steam'],
-                'exclude_keywords': 'demo, hentai',
-            },
-            'game_filters': {'max_price_new': 10},
+            'store_filter': {'include': ['steam']},
+            'game_filters': {'max_price_new': 10, 'exclude_keywords': 'demo, hentai'},
             'tracking_json': str(tracking_path),
         }
 
@@ -588,7 +484,7 @@ class ProfileDiagnosticTests(unittest.TestCase):
         self.assertTrue(validate_profiles(settings, require_webhook=False))
         self.assertFalse(validate_profiles(settings, require_webhook=True))
 
-    def test_legacy_keyword_setting_is_applied(self):
+    def test_current_keyword_setting_is_applied(self):
         profile = Bot_Profile(
             self.profile_settings('tracking.json'),
             api_client=self.profile_api_client(),

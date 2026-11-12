@@ -1,4 +1,3 @@
-import csv
 import hashlib
 import json
 import math
@@ -16,28 +15,38 @@ import tkinter.messagebox as messagebox
 import customtkinter as ctk
 
 try:
-    from .free_games_bot import DeliveryState, acquire_profile_run_lock, delivery_state_path, migrate_project_data, project_data_directory, project_settings_path, release_profile_run_lock, resolve_tracking_path, run_history_path
+    from .free_games_bot import DeliveryState, acquire_profile_run_lock, delivery_state_path, project_data_directory, project_settings_path, release_profile_run_lock, resolve_tracking_path, run_history_path
 except ImportError:
-    from free_games_bot import DeliveryState, acquire_profile_run_lock, delivery_state_path, migrate_project_data, project_data_directory, project_settings_path, release_profile_run_lock, resolve_tracking_path, run_history_path
+    from free_games_bot import DeliveryState, acquire_profile_run_lock, delivery_state_path, project_data_directory, project_settings_path, release_profile_run_lock, resolve_tracking_path, run_history_path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BOT_SCRIPT = Path(__file__).resolve().with_name('free_games_bot.py')
 TASKS_DIRECTORY = project_data_directory(PROJECT_ROOT) / 'tasks'
 SCHEDULES_PATH = project_data_directory(PROJECT_ROOT) / 'schedules.json'
-LEGACY_TASK_PREFIX = 'FreeGamesBot-'
 TASK_PREFIX = 'FreeGamesBot-v2-'
-LEGACY_TASK_CLEANUP_MARKER = project_data_directory(PROJECT_ROOT) / 'legacy-tasks-cleaned-v2'
 HISTORY_LIMIT = 40
 
 
 def build_profile(values, existing=None):
+    '''Builds a profile dictionary from the given values and existing profile.
+
+    Args:
+        values (dict): A dictionary containing the input values.
+        existing (dict, optional): An existing profile to update. Defaults to None.
+
+    Returns:
+        dict: The constructed profile dictionary.
+
+    Raises:
+        ValueError: If any required fields are missing or invalid.
+    '''
     profile = json.loads(json.dumps(existing or {}))
     api_params = profile.setdefault('api_params', {})
     store_filter = profile.setdefault('store_filter', {})
     game_filters = profile.setdefault('game_filters', {})
 
-    for key in ('key', 'country', 'sort', 'region'):
+    for key in ('key', 'country', 'sort'):
         api_params[key] = values[key].strip()
     if not api_params['country']:
         raise ValueError('Country is required.')
@@ -69,7 +78,6 @@ def build_profile(values, existing=None):
         raise ValueError('Enter at least one shop to include.')
     store_filter.pop('include', None)
     store_filter.pop('exclude', None)
-    store_filter.pop('exclude_keywords', None)
     store_filter[mode] = shops
 
     for key in ('min_discount_percent', 'min_price_old', 'max_price_new'):
@@ -100,7 +108,6 @@ class ProfileManager(ctk.CTkToplevel):
         ('max_posts_per_day', 'Maximum posts per day'),
         ('offset', 'Offset'),
         ('sort', 'Sort'),
-        ('region', 'Region'),
         ('shops', 'Shops (comma-separated names or IDs)'),
         ('min_discount_percent', 'Minimum discount (%)'),
         ('min_price_old', 'Minimum original price'),
@@ -156,9 +163,16 @@ class ProfileManager(ctk.CTkToplevel):
         self._select(selected) if selected in app.settings else self._new()
 
     def _refresh_menu(self):
+        '''Refreshes the profile menu with the current settings.'''
         self.profile_menu.configure(values=list(self.app.settings) or ['No profiles'])
 
     def _populate(self, name, profile):
+        '''Populates the form with the given profile data.
+
+        Args:
+            name (str): The name of the profile.
+            profile (dict): The profile data to populate the form with.
+        '''
         api = profile.get('api_params', {})
         stores = profile.get('store_filter', {})
         filters = profile.get('game_filters', {})
@@ -173,7 +187,6 @@ class ProfileManager(ctk.CTkToplevel):
             'max_posts_per_day': profile.get('max_posts_per_day', 10),
             'offset': api.get('offset', 0),
             'sort': api.get('sort', '-cut'),
-            'region': api.get('region', ''),
             'shops': ', '.join(str(shop) for shop in stores.get(mode.lower(), [])),
             'exclude_keywords': filters.get('exclude_keywords', stores.get('exclude_keywords', '')),
             'include_keywords': filters.get('include_keywords', ''),
@@ -188,17 +201,28 @@ class ProfileManager(ctk.CTkToplevel):
         self.mature.set(api.get('mature', False))
 
     def _new(self):
+        '''Initializes the form for creating a new profile.'''
         self.original_name = None
         self.selection.set('New profile')
         self._populate('', {})
 
     def _select(self, name):
+        '''Selects an existing profile and populates the form with its data.
+
+        Args:
+            name (str): The name of the profile to select.
+        '''
         if name in self.app.settings:
             self.original_name = name
             self.selection.set(name)
             self._populate(name, self.app.settings[name])
 
     def _save(self):
+        '''Saves the current profile form data.
+
+        Raises:
+            ValueError: If any validation checks fail.
+        '''
         try:
             values = {key: entry.get() for key, entry in self.entries.items()}
             name = values['name'].strip()
@@ -233,6 +257,11 @@ class ProfileManager(ctk.CTkToplevel):
             messagebox.showerror('Could not save profile', str(error), parent=self)
 
     def _remove(self):
+        '''Removes the currently selected profile.
+
+        Raises:
+            ValueError: If the profile is currently running or cannot be removed.
+        '''
         name = self.original_name
         if not name:
             return
@@ -282,19 +311,13 @@ class FreeGamesBotApp(ctk.CTk):
         self.weekday_var = ctk.StringVar(value='SUN')
         self.status_var = ctk.StringVar(value='Ready')
 
-        if os.name == 'nt':
-            try:
-                self._remove_legacy_scheduled_tasks()
-            except (OSError, RuntimeError) as error:
-                self.status_var.set('Legacy scheduled task cleanup failed')
-                messagebox.showwarning('Scheduled task cleanup failed', str(error), parent=self)
-
         self._build_ui()
         self._load_profiles()
         self._refresh_all()
         self.after(5000, self._poll_history)
 
     def _build_ui(self):
+        '''Builds the main user interface for the application.'''
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(3, weight=1)
         self.grid_rowconfigure(5, weight=1)
@@ -403,8 +426,8 @@ class FreeGamesBotApp(ctk.CTk):
         self._frequency_changed(self.frequency_var.get())
 
     def _load_profiles(self):
+        '''Loads the profiles from the project settings file.'''
         try:
-            migrate_project_data(PROJECT_ROOT)
             settings_path = project_settings_path(PROJECT_ROOT)
             self.settings = json.loads(settings_path.read_text(encoding='utf-8'))
             if not isinstance(self.settings, dict):
@@ -420,11 +443,22 @@ class FreeGamesBotApp(ctk.CTk):
         self._refresh_profile_menu()
 
     def _refresh_profile_menu(self, selected=None):
+        '''Refreshes the profile menu with the current settings.
+
+        Args:
+            selected (str, optional): The profile to select. Defaults to None.
+        '''
         profiles = list(self.settings)
         self.profile_menu.configure(values=profiles or ['No profiles'])
         self.profile_var.set(selected if selected is not None and selected in profiles else (profiles[0] if profiles else 'No profiles'))
 
     def _save_profiles(self, settings, selected=None):
+        '''Saves the given profiles to the project settings file.
+
+        Args:
+            settings (dict): The profile settings to save.
+            selected (str, optional): The profile to select after saving. Defaults to None.
+        '''
         settings_path = project_settings_path(PROJECT_ROOT)
         settings_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = settings_path.with_suffix('.json.tmp')
@@ -435,6 +469,7 @@ class FreeGamesBotApp(ctk.CTk):
         self.status_var.set('Profiles updated')
 
     def _manage_profiles(self):
+        '''Opens the profile manager dialog for managing profiles.'''
         if not self.settings_loaded:
             messagebox.showerror('Settings unavailable', 'Fix the settings file before managing profiles.')
             return
@@ -443,12 +478,26 @@ class FreeGamesBotApp(ctk.CTk):
         manager.grab_set()
 
     def _selected_profile(self):
+        '''Returns the currently selected profile.
+
+        Raises:
+            ValueError: If no valid profile is selected.
+
+        Returns:
+            str: The name of the selected profile.
+        '''
         profile = self.profile_var.get()
         if profile not in self.settings:
             raise ValueError('Select a configured profile first.')
         return profile
 
     def _set_busy(self, busy, text):
+        '''Sets the busy state of the application and updates the status text.
+
+        Args:
+            busy (bool): Whether the application is busy.
+            text (str): The status text to display.
+        '''
         self.running = busy
         self.status_var.set(text)
         state = 'disabled' if busy else 'normal'
@@ -459,12 +508,22 @@ class FreeGamesBotApp(ctk.CTk):
         self.manage_button.configure(state=state)
 
     def _write_output(self, text):
+        '''Writes the given text to the output console.
+
+        Args:
+            text (str): The text to write to the output console.
+        '''
         self.output.configure(state='normal')
         self.output.insert('end', text)
         self.output.see('end')
         self.output.configure(state='disabled')
 
     def _launch(self, mode=None):
+        '''Launches the bot with the specified mode and profile.
+
+        Args:
+            mode (str, optional): The mode to run the bot in. Defaults to None.
+        '''
         if self.running:
             return
         if mode is None:
@@ -482,6 +541,7 @@ class FreeGamesBotApp(ctk.CTk):
         self._write_output('\n> {}\n'.format(' '.join(command)))
 
         def worker():
+            '''Worker function to run the bot subprocess and handle its output.'''
             try:
                 result = subprocess.run(
                     command,
@@ -497,12 +557,15 @@ class FreeGamesBotApp(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _run_profile(self):
+        '''Runs the bot for the currently selected profile.'''
         self._launch('--run-profile')
 
     def _test_webhook(self):
+        '''Tests the webhook for the currently selected profile.'''
         self._launch('--test-webhook')
 
     def _run_all(self):
+        '''Runs the bot for all profiles after user confirmation.'''
         if messagebox.askyesno(
             'Run all profiles',
             'Run all profiles with their daily posting limits and update their tracking files?',
@@ -510,12 +573,23 @@ class FreeGamesBotApp(ctk.CTk):
             self._launch()
 
     def _finish_process(self, return_code, output):
+        '''Handles the completion of the bot subprocess.
+
+        Args:
+            return_code (int): The return code of the subprocess.
+            output (str): The combined stdout and stderr output of the subprocess.
+        '''
         if output:
             self._write_output(output)
         self._set_busy(False, 'Completed' if return_code == 0 else 'Failed; see output')
         self._refresh_all()
 
     def _frequency_changed(self, value):
+        '''Handles changes to the frequency selection.
+
+        Args:
+            value (str): The selected frequency value.
+        '''
         self.weekday_menu.configure(state='normal' if value == 'Weekly' else 'disabled')
 
     @staticmethod
@@ -528,39 +602,12 @@ class FreeGamesBotApp(ctk.CTk):
         return '{}{}'.format(TASK_PREFIX, self._profile_slug(profile))
 
     @staticmethod
-    def _remove_legacy_scheduled_tasks():
-        if LEGACY_TASK_CLEANUP_MARKER.exists():
-            return
-        result = subprocess.run(
-            ['schtasks.exe', '/Query', '/FO', 'CSV', '/NH'],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode:
-            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or 'Could not query scheduled tasks.')
-
-        legacy_tasks = []
-        for row in csv.reader(result.stdout.splitlines()):
-            if not row:
-                continue
-            task_name = row[0].lstrip('\\/')
-            if task_name.startswith(LEGACY_TASK_PREFIX) and not task_name.startswith(TASK_PREFIX):
-                legacy_tasks.append(row[0])
-        for task_name in legacy_tasks:
-            result = subprocess.run(
-                ['schtasks.exe', '/Delete', '/F', '/TN', task_name],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if result.returncode:
-                raise RuntimeError(result.stderr.strip() or result.stdout.strip() or 'Could not remove task {}.'.format(task_name))
-        LEGACY_TASK_CLEANUP_MARKER.parent.mkdir(parents=True, exist_ok=True)
-        LEGACY_TASK_CLEANUP_MARKER.write_text('done\n', encoding='utf-8')
-
-    @staticmethod
     def _read_schedules():
+        '''Reads the current scheduled tasks from the schedules file.
+
+        Returns:
+            dict: A dictionary of scheduled tasks.
+        '''
         try:
             return json.loads(SCHEDULES_PATH.read_text(encoding='utf-8'))
         except (OSError, json.JSONDecodeError):
@@ -568,11 +615,24 @@ class FreeGamesBotApp(ctk.CTk):
 
     @staticmethod
     def _write_schedules(schedules):
+        '''Writes the given schedules to the schedules file.
+
+        Args:
+            schedules (dict): A dictionary of scheduled tasks to write.
+        '''
         temporary = SCHEDULES_PATH.with_suffix('.tmp')
         temporary.write_text(json.dumps(schedules, indent=2), encoding='utf-8')
         temporary.replace(SCHEDULES_PATH)
 
     def _launcher_path(self, profile):
+        '''Generates the path to the launcher script for the given profile.
+
+        Args:
+            profile (str): The profile name.
+
+        Returns:
+            pathlib.Path: The path to the launcher script.
+        '''
         TASKS_DIRECTORY.mkdir(parents=True, exist_ok=True)
         slug = self._profile_slug(profile)
         launcher = TASKS_DIRECTORY / (slug + '.py')
@@ -599,6 +659,12 @@ class FreeGamesBotApp(ctk.CTk):
         return launcher
 
     def _save_schedule(self):
+        '''Saves the current schedule for the selected profile.
+
+        Raises:
+            ValueError: If the time format is invalid.
+            RuntimeError: If the Task Scheduler rejects the task.
+        '''
         if os.name != 'nt':
             messagebox.showerror('Windows required', 'Task Scheduler management is available on Windows.')
             return
@@ -644,6 +710,11 @@ class FreeGamesBotApp(ctk.CTk):
             messagebox.showerror('Could not save schedule', str(error))
 
     def _remove_schedule(self):
+        '''Removes the schedule for the selected profile.
+
+        Raises:
+            RuntimeError: If the Task Scheduler rejects the task removal.
+        '''
         try:
             profile = self._selected_profile()
         except ValueError as error:
@@ -672,6 +743,7 @@ class FreeGamesBotApp(ctk.CTk):
         self.status_var.set('Schedule removed for {}'.format(profile))
 
     def _refresh_schedules(self):
+        '''Refreshes the display of scheduled tasks in the UI.'''
         for child in self.schedule_list.winfo_children():
             child.destroy()
         schedules = self._read_schedules()
@@ -717,6 +789,7 @@ class FreeGamesBotApp(ctk.CTk):
         return candidate.strftime('%a %Y-%m-%d %H:%M')
 
     def _refresh_history(self):
+        '''Refreshes the display of the bot's run history in the UI.'''
         for child in self.history_list.winfo_children():
             child.destroy()
 
@@ -760,10 +833,12 @@ class FreeGamesBotApp(ctk.CTk):
                 )
 
     def _refresh_all(self):
+        '''Refreshes both the schedules and history displays in the UI.'''
         self._refresh_schedules()
         self._refresh_history()
 
     def _poll_history(self):
+        '''Periodically refreshes the bot's run history in the UI.'''
         self._refresh_history()
         self.after(5000, self._poll_history)
 

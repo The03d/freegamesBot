@@ -24,19 +24,43 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def project_data_directory(project_root=None):
+    '''Returns the path to the project data directory.
+
+    Args:
+        project_root (pathlib.Path, optional): The root of the project. Defaults to None.
+
+    Returns:
+        pathlib.Path: The path to the project data directory.
+    '''
     return Path(project_root if project_root is not None else PROJECT_ROOT) / 'data'
 
 
 def project_settings_path(project_root=None):
+    '''Returns the path to the project settings file.
+
+    Args:
+        project_root (pathlib.Path, optional): The root of the project. Defaults to None.
+
+    Returns:
+        pathlib.Path: The path to the project settings file.
+    '''
     root = Path(project_root if project_root is not None else PROJECT_ROOT)
-    current = project_data_directory(root) / 'settings.json'
-    legacy = root / 'settings.json'
-    if current.exists() and legacy.exists() and current.read_bytes() != legacy.read_bytes():
-        raise ValueError('Conflicting settings files: {} and {}'.format(legacy, current))
-    return current
+    return project_data_directory(root) / 'settings.json'
 
 
 def resolve_tracking_path(value, project_root=None):
+    '''Resolves the path to a tracking file inside the project data directory.
+
+    Args:
+        value (str): The relative path to the tracking file.
+        project_root (pathlib.Path, optional): The root of the project. Defaults to None.
+
+    Returns:
+        pathlib.Path: The resolved path to the tracking file inside the project data directory.
+
+    Raises:
+        ValueError: If the tracking file is not inside the project data directory or if the path is invalid.
+    '''
     root = Path(project_root if project_root is not None else PROJECT_ROOT)
     path = Path(value)
     if not value or path == Path('.'):
@@ -63,6 +87,11 @@ class DiscordWebhookSender:
         self.last_result = 'rejected'
 
     def format_payload(self):
+        '''Formats the payload for the Discord webhook.
+
+        Returns:
+            dict: The payload to be sent to the Discord webhook.
+        '''
         if not self.content:
             return {}
         return {'content': self.content}
@@ -124,10 +153,11 @@ class SlackWebhooks:
         self.content = kwargs.get('content')
 
     def format_payload(self):
-        """
-        Formats the data into a JSON object so it can be pushed
-        as a payload to Discord.
-        """
+        '''Formats the payload for the Slack webhook.
+
+        Returns:
+            dict: The payload to be sent to the Slack webhook.
+        '''
         # Initializes the default payload structure.
         payload = {}
         # Attaches data to the payload if provided.
@@ -183,6 +213,16 @@ class ITADClient:
 
     @staticmethod
     def _http_error_message(endpoint, response, api_key):
+        '''Generates a detailed error message for an HTTP response from the ITAD API.
+
+        Args:
+            endpoint (str): The API endpoint being accessed.
+            response (requests.Response): The HTTP response object.
+            api_key (str, optional): The API key used for the request. Defaults to None.
+
+        Returns:
+            str: A formatted error message including status code, response body, and suggested actions.
+        '''
         status_code = response.status_code
         reason = getattr(response, 'reason', '')
         message = "ITAD {} request failed: HTTP {}{}.".format(
@@ -232,6 +272,20 @@ class ITADClient:
         return message
 
     def _get_json(self, url, params, endpoint, api_key=None):
+        '''Performs a GET request to the specified ITAD API endpoint and returns the JSON response.
+
+        Args:
+            url (str): The full URL of the API endpoint.
+            params (dict): The query parameters for the request.
+            endpoint (str): The name of the API endpoint (for error messages).
+            api_key (str, optional): The API key to include in the request headers. Defaults to None.
+
+        Returns:
+            dict: The parsed JSON response from the API.
+
+        Raises:
+            ITADRequestError: If the request fails or the response is invalid.
+        '''
         headers = {'ITAD-API-Key': api_key} if api_key else None
         try:
             response = requests.get(url, params=params, headers=headers, timeout=self.TIMEOUT)
@@ -261,6 +315,17 @@ class ITADClient:
             raise ITADRequestError("ITAD {} returned invalid JSON.".format(endpoint)) from None
 
     def get_all_shops(self, country='US'):
+        '''Retrieves the list of all available stores from the ITAD API.
+
+        Args:
+            country (str, optional): The country code for which to retrieve stores. Defaults to 'US'.
+
+        Returns:
+            list: A list of dictionaries, each representing a store with 'id' and 'title' keys.
+
+        Raises:
+            ITADRequestError: If the API response is invalid or has an unexpected format.
+        '''
         response = self._get_json(self.STORES_URL, {'country': country}, "store list")
         try:
             shops = response
@@ -273,6 +338,18 @@ class ITADClient:
             raise ITADRequestError("ITAD store list response has an unexpected format.") from None
 
     def get_current_prices(self, game_ids, params):
+        '''Retrieves the current prices for the specified games from the ITAD API.
+
+        Args:
+            game_ids (list): A list of game IDs to query prices for.
+            params (dict): A dictionary of query parameters, including 'country', 'nondeals', 'shops', and 'key'.
+
+        Returns:
+            list: A list of dictionaries, each containing the game ID and its associated deals.
+
+        Raises:
+            ITADRequestError: If the API response is invalid or has an unexpected format.
+        '''
         query = {'country': params.get('country') or 'US', 'deals': not params.get('nondeals', False)}
         if params.get('shops'):
             query['shops'] = params['shops']
@@ -301,22 +378,41 @@ class ITADClient:
             raise ITADRequestError('ITAD prices response has an unexpected format.') from None
 
     def get_deals(self, params):
+        '''Retrieves all deals from the ITAD API based on the specified parameters.
+
+        Args:
+            params (dict): A dictionary of query parameters for the deals request.
+
+        Returns:
+            list: A list of deal items retrieved from the API.
+
+        Raises:
+            ITADRequestError: If the API response is invalid or has an unexpected format.
+        '''
         return [item for page in self.iter_deal_pages(params) for item in page]
 
     def iter_deal_pages(self, params):
+        '''Iterates over pages of deals from the ITAD API based on the specified parameters.
+
+        Args:
+            params (dict): A dictionary of query parameters for the deals request.
+
+        Yields:
+            list: A list of deal items for each page retrieved from the API.
+
+        Raises:
+            ITADRequestError: If the API response is invalid or has an unexpected format.
+        '''
         query = dict(params)
         api_key = query.pop('key', None)
         requested_limit = query.pop('limit', self.PAGE_LIMIT)
-        total_limit = None if requested_limit is None else int(self.PAGE_LIMIT if requested_limit == '' else requested_limit)
+        total_limit = None if requested_limit is None else int(requested_limit)
         if total_limit is not None and total_limit < 1:
             raise ValueError("The deals limit must be at least 1.")
 
         offset = int(query.pop('offset', 0) or 0)
         if offset < 0:
             raise ValueError("The deals offset cannot be negative.")
-        query.pop('region', None)
-        if query.get('sort') == 'cut:desc':
-            query['sort'] = '-cut'
         query.setdefault('nondeals', False)
         query.setdefault('mature', False)
         query = {key: value for key, value in query.items() if value not in (None, '')}
@@ -346,6 +442,19 @@ class ITADClient:
 
 
 def resolve_shops(store_filter, api_client, country='US'):
+    '''Resolves the shop IDs based on the provided store filter and available shops from the ITAD API.
+
+    Args:
+        store_filter (dict): A dictionary specifying which shops to include or exclude.
+        api_client (ITADClient): An instance of the ITAD API client.
+        country (str, optional): The country code for which to resolve shops. Defaults to 'US'.
+
+    Returns:
+        str: A comma-separated string of resolved shop IDs.
+
+    Raises:
+        ValueError: If the store filter is invalid or contains unknown shops.
+    '''
     if not isinstance(store_filter, dict):
         raise ValueError("store_filter must be an object.")
     if 'include' in store_filter and 'exclude' in store_filter:
@@ -369,6 +478,17 @@ def resolve_shops(store_filter, api_client, country='US'):
     shop_ids = {int(shop['id']) for shop in available_shops}
 
     def resolve_shop(shop):
+        '''Resolves a single shop to its corresponding ID.
+
+        Args:
+            shop (str|int): The shop name or ID to resolve.
+
+        Returns:
+            int: The resolved shop ID.
+
+        Raises:
+            ValueError: If the shop is unknown or not active for the specified country.
+        '''
         try:
             shop_id = int(shop)
         except (TypeError, ValueError):
@@ -416,8 +536,6 @@ class Bot_Profile:
 
             self.store_filter = dict(profile_info.get('store_filter', {}))
             self.game_filters = dict(profile_info.get('game_filters', {}))
-            if 'exclude_keywords' not in self.game_filters and 'exclude_keywords' in self.store_filter:
-                self.game_filters['exclude_keywords'] = self.store_filter['exclude_keywords']
             self.api_params['shops'] = self.filter_shops(self.api_params.get('country') or 'US')
 
             self.games = []
@@ -434,6 +552,14 @@ class Bot_Profile:
         self.failed_count = 0
 
     def passes_exclude_keywords(self, game):
+        '''Checks if a game passes the exclude keywords filter.
+
+        Args:
+            game (Game): The game object to check.
+
+        Returns:
+            bool: True if the game does not contain any of the exclude keywords in its title, False otherwise.
+        '''
         keywords = {
             keyword.strip().lower()
             for keyword in self.game_filters.get('exclude_keywords', '').split(',')
@@ -445,6 +571,14 @@ class Bot_Profile:
         return keywords.isdisjoint(title_words)
 
     def passes_include_keywords(self, game):
+        '''Checks if a game passes the include keywords filter.
+
+        Args:
+            game (Game): The game object to check.
+
+        Returns:
+            bool: True if the game contains at least one of the include keywords in its title, or if no include keywords are specified. False otherwise.
+        '''
         keywords = {
             keyword.strip().lower()
             for keyword in self.game_filters.get('include_keywords', '').split(',')
@@ -456,6 +590,14 @@ class Bot_Profile:
         return not keywords or not keywords.isdisjoint(title_words)
 
     def load_tracking_info(self, create_if_missing=True):
+        '''Loads the tracking information from the tracking JSON file.
+
+        Args:
+            create_if_missing (bool, optional): Whether to create the tracking JSON file if it does not exist. Defaults to True.
+
+        Returns:
+            list: A list of tracked game records.
+        '''
         try:
             with open(self.tracking_json, 'r') as tracking_file:
                 return json.load(tracking_file)
@@ -469,12 +611,28 @@ class Bot_Profile:
             return []
 
     def get_all_shops(self):
+        '''Retrieves all shops from the ITAD API.
+
+        Returns:
+            list: A list of all available shops.
+
+        Raises:
+            ITADRequestError: If the API response is invalid or has an unexpected format.
+        '''
         return self.api_client.get_all_shops()
 
     def filter_shops(self, country='US'):
         return resolve_shops(self.store_filter, self.api_client, country)
 
     def game_filter_check(self, game):
+        '''Checks if a game passes all the configured game filters.
+
+        Args:
+            game (Game): The game object to check.
+
+        Returns:
+            bool: True if the game passes all filters, False otherwise.
+        '''
         if not self.api_params.get('mature', False) and getattr(game, 'mature', False):
             return False
         for game_filter in self.game_filters:
@@ -486,12 +644,28 @@ class Bot_Profile:
         return True
 
     def game_tracking_check(self, game):
+        '''Checks if a game has already been tracked.
+
+        Args:
+            game (Game): The game object to check.
+
+        Returns:
+            bool: True if the game has been tracked before, False otherwise.
+        '''
         for past_game in self.tracking_info:
             if game.url == past_game.get('url') and game.price_cut == past_game.get('price_cut', 0.0):
                 return True
         return False
 
     def get_games(self, prepare_webhooks=True):
+        '''Retrieves and processes games from the ITAD API.
+
+        Args:
+            prepare_webhooks (bool, optional): Whether to prepare webhooks for the games. Defaults to True.
+
+        Returns:
+            None
+        '''
         candidate_games = self.api_client.get_deals(self.api_params)
         self.candidate_count = len(candidate_games)
         self.filtered_count = 0
@@ -513,6 +687,11 @@ class Bot_Profile:
             self.games.append( game )
 
     def send_games( self ):
+        '''Sends the prepared games via webhooks.
+
+        Returns:
+            tuple: A tuple containing the count of successfully sent games and the count of failed games.
+        '''
         self.posted_records = []
         self.sent_count = 0
         self.failed_count = 0
@@ -529,6 +708,11 @@ class Bot_Profile:
         return self.sent_count, self.failed_count
 
     def update_tracking_json( self ):
+        '''Updates the tracking JSON file with the newly posted game records.
+
+        Returns:
+            None
+        '''
         tracked_records = list(self.tracking_info)
         known_records = {
             (record.get('url'), record.get('price_cut', 0.0))
@@ -587,6 +771,14 @@ class Game:
                                                                                     self.url )
 
     def create_web_hook( self, web_hook_address ):
+        '''Creates a webhook for the game based on the provided address.
+
+        Args:
+            web_hook_address (str): The webhook URL to use for posting the game announcement.
+
+        Returns:
+            None
+        '''
         if not isinstance(web_hook_address, str):
             print("No valid webhook provider configured.")
             return
@@ -602,6 +794,11 @@ class Game:
         print("No valid webhook provider configured.")
 
     def send_web_hook( self ):
+        '''Sends the game announcement via the configured webhook.
+
+        Returns:
+            bool: True if the webhook was successfully sent, False otherwise.
+        '''
         print("*** Posting {} from {}.".format(self.title, self.shop))
         if self.web_hook is None:
             print("No valid webhook configured for this game.")
@@ -610,6 +807,11 @@ class Game:
         return succeeded
 
     def output_record( self ):
+        '''Generates a dictionary representation of the game record for tracking purposes.
+
+        Returns:
+            dict: A dictionary containing the game's title, shop, URL, added date, and price cut.
+        '''
         return {
             "title":    self.title,
             "shop":     self.shop,
@@ -649,6 +851,19 @@ default_settings = json.dumps( {
   } }, sort_keys=True, indent=4 )
 
 def load_json_settings(json_file, create_if_missing=True):
+    '''Loads the JSON settings from the specified file.
+
+    Args:
+        json_file (str): The path to the JSON settings file.
+        create_if_missing (bool, optional): Whether to create the file with default settings if it doesn't exist. Defaults to True.
+
+    Returns:
+        dict: The loaded settings as a dictionary.
+
+    Raises:
+        FileNotFoundError: If the file doesn't exist and create_if_missing is False.
+        ValueError: If the loaded settings are not in the expected format.
+    '''
     path = Path(json_file)
     try:
         settings = json.loads(path.read_text(encoding='utf-8'))
@@ -668,6 +883,15 @@ def load_json_settings(json_file, create_if_missing=True):
 
 
 def validate_profiles(settings, require_webhook=True):
+    '''Validates the profiles in the settings dictionary.
+
+    Args:
+        settings (dict): The loaded settings dictionary.
+        require_webhook (bool, optional): Whether to require a webhook address for each profile. Defaults to True.
+
+    Returns:
+        bool: True if all profiles are valid, False otherwise.
+    '''
     is_valid = True
     needs_setup = False
     for profile in settings:
@@ -687,6 +911,16 @@ def validate_profiles(settings, require_webhook=True):
 
 
 def run_api_check(profile_info, profile_name, api_client=None):
+    '''Runs an API check for the given profile.
+
+    Args:
+        profile_info (dict): The profile's configuration information.
+        profile_name (str): The name of the profile.
+        api_client (ITADClient, optional): The API client to use. Defaults to None.
+
+    Returns:
+        int: The number of deals received from the API.
+    '''
     api_client = api_client or ITADClient()
     api_params = dict(profile_info['api_params'])
     api_params['shops'] = resolve_shops(
@@ -700,6 +934,16 @@ def run_api_check(profile_info, profile_name, api_client=None):
 
 
 def run_dry_run(profile_info, profile_name, api_client=None):
+    '''Performs a dry run for the given profile, simulating the retrieval and processing of games without making any changes.
+
+    Args:
+        profile_info (dict): The profile's configuration information.
+        profile_name (str): The name of the profile.
+        api_client (ITADClient, optional): The API client to use. Defaults to None.
+
+    Returns:
+        Bot_Profile: The bot instance used for the dry run.
+    '''
     bot = Bot_Profile(profile_info, profile_name, api_client=api_client, read_only=True)
     bot.get_games(prepare_webhooks=False)
     eligible_count = len(bot.games)
@@ -718,16 +962,37 @@ def run_dry_run(profile_info, profile_name, api_client=None):
 
 
 def delivery_state_path(project_root=None):
+    '''Returns the path to the delivery state SQLite database file.
+
+    Args:
+        project_root (str, optional): The root directory of the project. Defaults to None.
+
+    Returns:
+        Path: The path to the delivery state SQLite database file.
+    '''
     data_directory = project_data_directory(project_root)
     data_directory.mkdir(parents=True, exist_ok=True)
     return data_directory / 'delivery-state.sqlite3'
 
 
 def run_history_path(project_root=None):
+    '''Returns the path to the run history JSONL file.
+
+    Args:
+        project_root (str, optional): The root directory of the project. Defaults to None.
+
+    Returns:
+        Path: The path to the run history JSONL file.
+    '''
     return project_data_directory(project_root) / 'run-history.jsonl'
 
 
 def append_run_history(run_record):
+    '''Appends a run record to the run history JSONL file.
+
+    Args:
+        run_record (dict): The run record to append.
+    '''
     history_path = run_history_path()
     history_path.parent.mkdir(parents=True, exist_ok=True)
     with history_path.open('a', encoding='utf-8') as history_file:
@@ -735,6 +1000,15 @@ def append_run_history(run_record):
 
 
 def acquire_profile_run_lock(profile_name, project_root=None):
+    '''Acquires a run lock for the specified profile to prevent concurrent executions.
+
+    Args:
+        profile_name (str): The name of the profile.
+        project_root (str, optional): The root directory of the project. Defaults to None.
+
+    Returns:
+        file: The lock file object if the lock was successfully acquired, None otherwise.
+    '''
     lock_directory = project_data_directory(project_root) / 'run-locks'
     lock_directory.mkdir(parents=True, exist_ok=True)
     lock_name = hashlib.sha256(profile_name.encode('utf-8')).hexdigest() + '.lock'
@@ -759,6 +1033,11 @@ def acquire_profile_run_lock(profile_name, project_root=None):
 
 
 def release_profile_run_lock(lock_file):
+    '''Releases a previously acquired run lock for a profile.
+
+    Args:
+        lock_file (file): The lock file object to release.
+    '''
     try:
         lock_file.seek(0)
         if os.name == 'nt':
@@ -771,90 +1050,16 @@ def release_profile_run_lock(lock_file):
         lock_file.close()
 
 
-def migrate_project_data(project_root=None):
-    root = Path(project_root if project_root is not None else PROJECT_ROOT)
-    data_directory = project_data_directory(root)
-    migration_lock = acquire_profile_run_lock('__project_data_migration__:' + str(root.resolve()), root)
-    if migration_lock is None:
-        raise ValueError('Project data migration is already running.')
-    profile_locks = []
-    try:
-        legacy_settings = root / 'settings.json'
-        new_settings = data_directory / 'settings.json'
-        if legacy_settings.exists() and new_settings.exists() and legacy_settings.read_bytes() != new_settings.read_bytes():
-            raise ValueError('Conflicting settings files: {} and {}'.format(legacy_settings, new_settings))
-        settings_path = new_settings if new_settings.exists() else legacy_settings
-        settings = {}
-        settings_content = None
-        if settings_path.exists():
-            settings_content = settings_path.read_bytes()
-            settings = json.loads(settings_content)
-            if not isinstance(settings, dict) or not all(isinstance(profile, dict) for profile in settings.values()):
-                raise ValueError('Settings must contain a profile object.')
-
-        moves = {path: data_directory / path.name for path in root.glob('posted_*.json') if path.is_file()}
-        for profile in settings.values():
-            tracking = profile.get('tracking_json')
-            if tracking:
-                path = Path(tracking)
-                if path.is_absolute():
-                    continue
-                legacy_path = (root / path).resolve()
-                try:
-                    legacy_path.relative_to(root.resolve())
-                except ValueError:
-                    continue
-                if legacy_path.is_file():
-                    moves[legacy_path] = data_directory / path
-        if legacy_settings.exists():
-            moves[legacy_settings] = data_directory / 'settings.json'
-        moves = {source: destination for source, destination in moves.items() if source.is_file()}
-        if not moves:
-            return
-
-        for state_id in sorted({profile.get('state_id', name) for name, profile in settings.items()}):
-            lock_file = acquire_profile_run_lock(state_id, root)
-            if lock_file is None:
-                raise ValueError('A profile is running; retry project data migration after it finishes.')
-            profile_locks.append(lock_file)
-        if settings_content is not None and settings_path.read_bytes() != settings_content:
-            raise ValueError('Settings changed during project data migration.')
-        snapshots = {source: source.read_bytes() for source in moves}
-        for source, content in snapshots.items():
-            destination = moves[source]
-            if destination.exists() and destination.read_bytes() != content:
-                raise ValueError('Conflicting project data files: {} and {}'.format(source, destination))
-
-        if snapshots:
-            data_directory.mkdir(parents=True, exist_ok=True)
-        for source in sorted(snapshots, key=lambda path: path.name == 'settings.json'):
-            destination = moves[source]
-            content = snapshots[source]
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            if source.read_bytes() != content:
-                raise ValueError('Project data changed during migration: {}'.format(source))
-            if not destination.exists():
-                try:
-                    with destination.open('xb') as target:
-                        target.write(content)
-                        target.flush()
-                        os.fsync(target.fileno())
-                except FileExistsError:
-                    pass
-            if destination.read_bytes() != content:
-                raise ValueError('Could not verify migrated project data: {}'.format(destination))
-        for source, content in snapshots.items():
-            if source.read_bytes() != content:
-                raise ValueError('Project data changed during migration: {}'.format(source))
-        for source in snapshots:
-            source.unlink()
-    finally:
-        for lock_file in reversed(profile_locks):
-            release_profile_run_lock(lock_file)
-        release_profile_run_lock(migration_lock)
-
-
 def _redact_run_error(error, profile_info):
+    '''Redacts sensitive information from an error message based on the profile information.
+
+    Args:
+        error (Exception): The error to redact.
+        profile_info (dict): The profile's configuration information.
+
+    Returns:
+        str: The redacted error message.
+    '''
     message = "{}: {}".format(type(error).__name__, error)
     secrets = [
         profile_info.get('api_params', {}).get('key'),
@@ -867,10 +1072,22 @@ def _redact_run_error(error, profile_info):
 
 
 def _local_day():
+    '''Returns the current local day as an ISO 8601 formatted string.
+
+    Returns:
+        str: The current local day in ISO 8601 format.
+    '''
     return datetime.now().astimezone().date().isoformat()
 
 
 def _sync_delivery_tracking(bot, state, state_id):
+    '''Synchronizes the delivery tracking information for the specified profile.
+
+    Args:
+        bot (object): The bot instance containing tracking information.
+        state (object): The state object managing sent and queued records.
+        state_id (str): The identifier for the profile's state.
+    '''
     records = state.sent_records(state_id)
     tracked = {(record.get('url'), record.get('price_cut', 0.0)) for record in bot.tracking_info}
     if any((record.get('url'), record.get('price_cut', 0.0)) not in tracked for record in records):
@@ -879,6 +1096,15 @@ def _sync_delivery_tracking(bot, state, state_id):
 
 
 def _execute_queued_profile(bot, state, state_id, maximum, run_record):
+    '''Executes the queued profile by processing deal pages and updating the state.
+
+    Args:
+        bot (object): The bot instance containing API client and parameters.
+        state (object): The state object managing sent and queued records.
+        state_id (str): The identifier for the profile's state.
+        maximum (int): The maximum number of deals to process for the profile.
+        run_record (dict): The record tracking the run's statistics.
+    '''
     _sync_delivery_tracking(bot, state, state_id)
     used, sent_today = state.counts(state_id, _local_day())
     if used < maximum:
@@ -969,6 +1195,12 @@ def _execute_queued_profile(bot, state, state_id, maximum, run_record):
 
 
 def run_profile(profile_info, profile_name):
+    '''Runs the profile by processing queued deals and updating the run record.
+
+    Args:
+        profile_info (dict): The profile's configuration information.
+        profile_name (str): The name of the profile.
+    '''
     started = datetime.now(timezone.utc)
     start_time = time.monotonic()
     run_record = {
@@ -1033,6 +1265,15 @@ def run_profile(profile_info, profile_name):
 
 
 def run_webhook_test(profile_info, profile_name):
+    '''Tests the webhook for the specified profile by sending a test message.
+
+    Args:
+        profile_info (dict): The profile's configuration information.
+        profile_name (str): The name of the profile.
+
+    Returns:
+        bool: True if the webhook test succeeded, False otherwise.
+    '''
     webhook_url = profile_info.get('web_hook_address', '')
     message = "FreeGamesBot webhook test for '{}' at {}.".format(
         profile_name,
@@ -1052,6 +1293,18 @@ def run_webhook_test(profile_info, profile_name):
 
 
 def manage_uncertain_deliveries(profile_info, profile_name, delivery_id=None, outcome=None, confirmed=False):
+    '''Manages uncertain deliveries for the specified profile, allowing the user to confirm or reject them.
+
+    Args:
+        profile_info (dict): The profile's configuration information.
+        profile_name (str): The name of the profile.
+        delivery_id (str, optional): The ID of the delivery to manage. Defaults to None.
+        outcome (str, optional): The outcome to apply ('sent' or 'not-sent'). Defaults to None.
+        confirmed (bool, optional): Whether the action is confirmed. Defaults to False.
+
+    Raises:
+        ValueError: If another run for this profile is active or if invalid parameters are provided.
+    '''
     state_id = profile_info.get('state_id', profile_name)
     lock_file = acquire_profile_run_lock(state_id)
     if lock_file is None:
@@ -1083,6 +1336,14 @@ def manage_uncertain_deliveries(profile_info, profile_name, delivery_id=None, ou
 
 
 def main(argv=None):
+    '''Entry point for the free games bot command-line interface.
+
+    Args:
+        argv (list, optional): List of command-line arguments. Defaults to None.
+
+    Returns:
+        int: Exit code indicating success (0) or failure (1).
+    '''
     parser = argparse.ArgumentParser(description="Find deals and post them to configured webhooks.")
     diagnostic_modes = parser.add_mutually_exclusive_group()
     diagnostic_modes.add_argument("--check-api", metavar="PROFILE", help="Test ITAD connectivity without a webhook.")
@@ -1103,7 +1364,6 @@ def main(argv=None):
     )
     diagnostic = bool(args.check_api or args.dry_run)
     try:
-        migrate_project_data()
         settings_path = project_settings_path()
         settings = load_json_settings(settings_path, create_if_missing=not diagnostic)
     except (OSError, ValueError) as error:
