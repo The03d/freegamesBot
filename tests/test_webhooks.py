@@ -35,6 +35,7 @@ class DiscordWebhookSenderTests(unittest.TestCase):
         sender = DiscordWebhookSender('https://discord.com/api/webhooks/test', 'New game')
 
         self.assertFalse(sender.send())
+        self.assertEqual(sender.last_result, 'uncertain')
 
     @patch('src.free_games_bot.requests.post')
     def test_send_returns_false_for_http_errors(self, post):
@@ -108,6 +109,7 @@ class DiscordWebhookSenderTests(unittest.TestCase):
             self.assertFalse(sender.send())
 
         self.assertIn('HTTP 404 Not Found', output.getvalue())
+        self.assertEqual(sender.last_result, 'rejected')
         self.assertNotIn(webhook_url, output.getvalue())
 
 

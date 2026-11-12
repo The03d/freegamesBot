@@ -7,16 +7,203 @@ from unittest.mock import Mock, patch
 
 import requests
 
+from src.delivery_state import DeliveryState
 from src.free_games_bot import (
     Bot_Profile,
     Game,
     ITADClient,
     ITADRequestError,
     run_profile,
+    manage_uncertain_deliveries,
     resolve_shops,
     run_api_check,
     validate_profiles,
 )
+
+
+class DeliveryStateTests(unittest.TestCase):
+    def test_queue_and_daily_reservations_survive_restart(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / 'delivery.sqlite3'
+            state = DeliveryState(path)
+            item = {'id': 'game', 'deal': {'shop': {'id': 61}, 'cut': 100}}
+            state.enqueue('profile', item)
+            state.enqueue('profile', item)
+            entry_id, _ = state.queued('profile')[0]
+            delivery_id = state.reserve('profile', entry_id, '2026-11-11', 1)
+            self.assertEqual(state.counts('profile', '2026-11-11'), (1, 0))
+            self.assertEqual(state.counts('other-profile', '2026-11-11'), (0, 0))
+            state.close()
+
+            state = DeliveryState(path)
+            self.assertEqual(len(state.uncertain('profile')), 1)
+            self.assertEqual(state.queued('profile'), [])
+            state.confirm(delivery_id, {'url': 'deal', 'price_cut': 100})
+            self.assertEqual(state.counts('profile', '2026-11-11'), (1, 1))
+            self.assertEqual(state.counts('profile', '2026-11-12'), (0, 0))
+            self.assertEqual(len(state.sent_records('profile')), 1)
+            state.close()
+
+    def test_uncertain_delivery_requires_confirmation_and_can_be_requeued(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict('os.environ', {'FREEGAMESBOT_DATA_DIR': temp_dir}):
+            state = DeliveryState(Path(temp_dir) / 'delivery-state.sqlite3')
+            item = {'id': 'game', 'title': 'Game', 'deal': {'shop': {'id': 61, 'name': 'Steam'}, 'cut': 100}}
+            state.enqueue('profile', item)
+            entry_id, _ = state.queued('profile')[0]
+            changed_item = dict(item, deal=dict(item['deal'], cut=80))
+            state.enqueue('profile', changed_item)
+            delivery_id = state.reserve('profile', entry_id, '2026-11-11', 10)
+            state.enqueue('profile', changed_item)
+            self.assertTrue(state.blocked('profile', 'game', 61))
+            self.assertEqual(len(state.queued('profile')), 1)
+            state.close()
+            with self.assertRaisesRegex(ValueError, 'confirm'):
+                manage_uncertain_deliveries({}, 'profile', delivery_id, 'not-sent')
+            manage_uncertain_deliveries({}, 'profile', delivery_id, 'not-sent', confirmed=True)
+            state = DeliveryState(Path(temp_dir) / 'delivery-state.sqlite3')
+            self.assertEqual(state.counts('profile', '2026-11-11'), (0, 0))
+            self.assertEqual(len(state.queued('profile')), 2)
+            self.assertFalse(state.blocked('profile', 'game', 61))
+            state.close()
+
+class QueuedRunTests(unittest.TestCase):
+    def make_offer(self, index):
+        return {
+            'id': 'game-{}'.format(index), 'title': 'Game {}'.format(index), 'mature': False,
+            'deal': {
+                'timestamp': '2026-01-01T00:00:00Z', 'expiry': None, 'drm': [], 'cut': 100,
+                'price': {'amount': 0, 'currency': 'CAD'},
+                'regular': {'amount': 50, 'currency': 'CAD'},
+                'shop': {'id': 61, 'name': 'Steam'}, 'url': 'https://example.test/{}'.format(index),
+            },
+        }
+
+    def test_daily_cap_and_queue_across_runs(self):
+        offers = [self.make_offer(index) for index in range(25)]
+        client = Mock()
+        client.get_all_shops.return_value = [{'id': 61, 'title': 'Steam'}]
+        client.iter_deal_pages.side_effect = lambda params: iter([offers])
+        client.get_current_prices.side_effect = lambda ids, params: [
+            {'id': item['id'], 'deals': [item['deal']]} for item in offers if item['id'] in ids
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile = {
+                'api_params': {'key': 'key', 'country': 'CA', 'limit': None},
+                'store_filter': {'include': ['Steam']}, 'game_filters': {'max_price_new': 0},
+                'web_hook_address': 'https://discord.com/api/webhooks/test/token',
+                'tracking_json': str(Path(temp_dir) / 'tracking.json'),
+            }
+            with patch.dict('os.environ', {'FREEGAMESBOT_DATA_DIR': temp_dir}), \
+                    patch('src.free_games_bot.ITADClient', return_value=client) as client_class, \
+                    patch('src.free_games_bot.requests.post', return_value=Mock()) as post, \
+                    patch('src.free_games_bot.time.sleep'), \
+                    patch('src.free_games_bot._local_day', return_value='2026-11-11') as day:
+                client_class.PAGE_LIMIT = 200
+                first = run_profile(profile, 'Test')
+                Path(profile['tracking_json']).write_text('[]')
+                second = run_profile(profile, 'Test')
+                self.assertEqual((first['sent'], first['queued'], second['sent']), (10, 15, 0))
+                self.assertEqual(len(json.loads(Path(profile['tracking_json']).read_text())), 10)
+                self.assertEqual(post.call_count, 10)
+                day.return_value = '2026-11-12'
+                third = run_profile(profile, 'Test')
+                self.assertEqual((third['sent'], third['queued']), (10, 5))
+                self.assertEqual(post.call_count, 20)
+                self.assertEqual(len(json.loads(Path(profile['tracking_json']).read_text())), 20)
+
+    def test_expired_and_changed_price_are_not_posted(self):
+        offers = [self.make_offer(0), self.make_offer(1)]
+        refreshed = [self.make_offer(0), self.make_offer(1)]
+        refreshed[0]['deal']['expiry'] = '2000-01-01T00:00:00Z'
+        refreshed[1]['deal']['price']['amount'] = 5
+        client = Mock()
+        client.get_all_shops.return_value = [{'id': 61, 'title': 'Steam'}]
+        client.iter_deal_pages.side_effect = lambda params: iter([offers])
+        client.get_current_prices.return_value = [
+            {'id': item['id'], 'deals': [item['deal']]} for item in refreshed
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile = {
+                'api_params': {'key': 'key', 'country': 'CA'}, 'store_filter': {'include': ['Steam']},
+                'game_filters': {'max_price_new': 0}, 'tracking_json': str(Path(temp_dir) / 'tracking.json'),
+                'web_hook_address': 'https://discord.com/api/webhooks/test/token',
+            }
+            with patch.dict('os.environ', {'FREEGAMESBOT_DATA_DIR': temp_dir}), \
+                    patch('src.free_games_bot.ITADClient', return_value=client) as client_class, \
+                    patch('src.free_games_bot.requests.post') as post:
+                client_class.PAGE_LIMIT = 200
+                result = run_profile(profile, 'Test')
+            self.assertEqual((result['sent'], result['queued']), (0, 0))
+            post.assert_not_called()
+
+    def test_timeout_remains_uncertain_and_is_not_resent(self):
+        offer = self.make_offer(0)
+        client = Mock()
+        client.get_all_shops.return_value = [{'id': 61, 'title': 'Steam'}]
+        client.iter_deal_pages.side_effect = lambda params: iter([[offer]])
+        client.get_current_prices.return_value = [{'id': offer['id'], 'deals': [offer['deal']]}]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile = {
+                'api_params': {'key': 'key', 'country': 'CA'}, 'store_filter': {'include': ['Steam']},
+                'game_filters': {'max_price_new': 0}, 'tracking_json': str(Path(temp_dir) / 'tracking.json'),
+                'web_hook_address': 'https://discord.com/api/webhooks/test/token',
+            }
+            with patch.dict('os.environ', {'FREEGAMESBOT_DATA_DIR': temp_dir}), \
+                    patch('src.free_games_bot.ITADClient', return_value=client) as client_class, \
+                    patch('src.free_games_bot.requests.post', side_effect=requests.exceptions.ReadTimeout) as post:
+                client_class.PAGE_LIMIT = 200
+                first = run_profile(profile, 'Test')
+                second = run_profile(profile, 'Test')
+            self.assertEqual((first['status'], first['uncertain'], second['uncertain']), ('partial', 1, 1))
+            self.assertEqual(post.call_count, 1)
+
+    def test_partial_discovery_still_processes_saved_candidates(self):
+        offer = self.make_offer(0)
+        client = Mock()
+        client.get_all_shops.return_value = [{'id': 61, 'title': 'Steam'}]
+        def partial_pages(params):
+            yield [offer]
+            raise ITADRequestError('rate limited')
+        client.iter_deal_pages.side_effect = partial_pages
+        client.get_current_prices.return_value = [{'id': offer['id'], 'deals': [offer['deal']]}]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile = {
+                'api_params': {'key': 'key', 'country': 'CA'}, 'store_filter': {'include': ['Steam']},
+                'game_filters': {'max_price_new': 0}, 'tracking_json': str(Path(temp_dir) / 'tracking.json'),
+                'web_hook_address': 'https://discord.com/api/webhooks/test/token',
+            }
+            with patch.dict('os.environ', {'FREEGAMESBOT_DATA_DIR': temp_dir}), \
+                    patch('src.free_games_bot.ITADClient', return_value=client) as client_class, \
+                    patch('src.free_games_bot.requests.post', return_value=Mock()) as post, \
+                    patch('src.free_games_bot.time.sleep'):
+                client_class.PAGE_LIMIT = 200
+                result = run_profile(profile, 'Test')
+            self.assertEqual((result['status'], result['sent']), ('partial', 1))
+            self.assertTrue(result['discovery_incomplete'])
+            post.assert_called_once()
+
+    def test_price_verification_failure_keeps_queue_without_posting(self):
+        offer = self.make_offer(0)
+        client = Mock()
+        client.get_all_shops.return_value = [{'id': 61, 'title': 'Steam'}]
+        client.iter_deal_pages.side_effect = lambda params: iter([[offer]])
+        client.get_current_prices.side_effect = ITADRequestError('prices unavailable')
+        with tempfile.TemporaryDirectory() as temp_dir:
+            profile = {
+                'api_params': {'key': 'key', 'country': 'CA'}, 'store_filter': {'include': ['Steam']},
+                'game_filters': {'max_price_new': 0}, 'tracking_json': str(Path(temp_dir) / 'tracking.json'),
+                'web_hook_address': 'https://discord.com/api/webhooks/test/token',
+            }
+            with patch.dict('os.environ', {'FREEGAMESBOT_DATA_DIR': temp_dir}), \
+                    patch('src.free_games_bot.ITADClient', return_value=client) as client_class, \
+                    patch('src.free_games_bot.requests.post') as post:
+                client_class.PAGE_LIMIT = 200
+                result = run_profile(profile, 'Test')
+                state = DeliveryState(Path(temp_dir) / 'delivery-state.sqlite3')
+                self.assertEqual(len(state.queued('Test')), 1)
+                state.close()
+            self.assertEqual(result['status'], 'failed')
+            post.assert_not_called()
 
 
 class ITADClientTests(unittest.TestCase):
@@ -100,6 +287,34 @@ class ITADClientTests(unittest.TestCase):
         self.assertEqual(get.call_args_list[1].kwargs['params']['offset'], 210)
         self.assertEqual(get.call_args_list[1].kwargs['params']['limit'], 1)
         self.assertEqual(get.call_args_list[0].kwargs['headers'], {'ITAD-API-Key': 'secret'})
+
+    def test_unlimited_deals_exceed_old_limit_with_bounded_pages(self):
+        client = ITADClient()
+        def page_response(url, params, endpoint, api_key):
+            offset = params['offset']
+            return {
+                'list': [{'title': 'Deal'}] * (200 if offset < 4000 else 1),
+                'hasMore': offset < 4000,
+                'nextOffset': offset + 200,
+            }
+        with patch.object(client, '_get_json', side_effect=page_response) as request:
+            self.assertEqual(len(client.get_deals({'limit': None})), 4001)
+        self.assertEqual(request.call_count, 21)
+        self.assertTrue(all(call.args[1]['limit'] == 200 for call in request.call_args_list))
+
+    def test_deals_reject_zero_limit(self):
+        with self.assertRaisesRegex(ValueError, 'at least 1'):
+            ITADClient().get_deals({'limit': 0})
+
+    @patch('src.free_games_bot.requests.post')
+    def test_current_prices_use_game_ids_country_and_shops(self, post):
+        post.return_value.json.return_value = [{'id': 'game', 'deals': []}]
+        params = {'country': 'CA', 'key': 'private', 'shops': '61', 'nondeals': False}
+        self.assertEqual(ITADClient().get_current_prices(['game'], params), [{'id': 'game', 'deals': []}])
+        post.assert_called_once_with(
+            ITADClient.PRICES_URL, params={'country': 'CA', 'deals': True, 'shops': '61'},
+            json=['game'], headers={'ITAD-API-Key': 'private'}, timeout=15,
+        )
 
     @patch('src.free_games_bot.requests.get')
     def test_request_errors_do_not_expose_api_key(self, get):
@@ -224,6 +439,16 @@ class ProfileDiagnosticTests(unittest.TestCase):
         accepted_game = SimpleNamespace(title='A complete game', price_new=1)
         self.assertFalse(profile.game_filter_check(rejected_game))
         self.assertTrue(profile.game_filter_check(accepted_game))
+
+    def test_include_keywords_matches_any_title_word_and_empty_allows_all(self):
+        settings = self.profile_settings('unused.json')
+        settings['game_filters']['include_keywords'] = 'adventure, PUZZLE'
+        profile = Bot_Profile(settings, api_client=self.profile_api_client(), read_only=True)
+
+        self.assertTrue(profile.game_filter_check(SimpleNamespace(title='A puzzle, game', price_new=1)))
+        self.assertFalse(profile.game_filter_check(SimpleNamespace(title='A platform game', price_new=1)))
+        profile.game_filters['include_keywords'] = ' , '
+        self.assertTrue(profile.game_filter_check(SimpleNamespace(title='A platform game', price_new=1)))
 
     def test_v2_free_steam_offer_normalizes_and_passes_filters(self):
         api_client = self.profile_api_client()
@@ -387,15 +612,17 @@ class ProfileDiagnosticTests(unittest.TestCase):
             bot.sent_count = 2
             bot.failed_count = 0
 
+            def execute(bot, state, state_id, maximum, record):
+                record.update(candidates=5, filtered=2, duplicates=1, eligible=2, sent=2, failed=0)
             with patch.dict('os.environ', {'FREEGAMESBOT_DATA_DIR': temp_dir}), \
                     patch('src.free_games_bot.validate_profiles', return_value=True), \
-                    patch('src.free_games_bot.Bot_Profile', return_value=bot):
+                    patch('src.free_games_bot.Bot_Profile', return_value=bot), \
+                    patch('src.free_games_bot._execute_queued_profile', side_effect=execute):
                 result = run_profile(profile_info, 'Test')
 
             self.assertEqual(result['status'], 'success')
             self.assertEqual(result['sent'], 2)
             self.assertEqual(result['failed'], 0)
-            bot.update_tracking_json.assert_called_once_with()
 
     def test_api_check_uses_configured_shop_filter_without_webhook(self):
         api_client = Mock()

@@ -15,6 +15,11 @@ import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    from .delivery_state import DeliveryState
+except ImportError:
+    from delivery_state import DeliveryState
+
 '''*******************************************************************
 ******************** Custom Webhooks Classes!!! **********************
 *******************************************************************'''
@@ -23,6 +28,7 @@ class DiscordWebhookSender:
     def __init__(self, webhook_url, content=None):
         self.webhook_url = webhook_url
         self.content = content
+        self.last_result = 'rejected'
 
     def format_payload(self):
         if not self.content:
@@ -41,14 +47,18 @@ class DiscordWebhookSender:
             return False
 
         try:
+            self.last_result = 'uncertain'
             request = requests.post(self.webhook_url, json=payload, timeout=10)
             request.raise_for_status()
+            self.last_result = 'sent'
             return True
         except requests.exceptions.HTTPError as error:
             response = error.response
             if response is None:
                 print("Error: Discord webhook rejected the request (HTTP status unavailable).")
             else:
+                if 400 <= response.status_code < 500 and response.status_code != 408:
+                    self.last_result = 'rejected'
                 try:
                     body = response.json()
                 except ValueError:
@@ -75,6 +85,7 @@ class SlackWebhooks:
     def __init__(self, webhook_url, **kwargs ):
         self.webhook_url = webhook_url
         self.content = kwargs.get('content')
+        self.last_result = 'rejected'
         # self.blocks = None
 
     def set_content(self, **kwargs):
@@ -109,16 +120,21 @@ class SlackWebhooks:
 
         else:
             try:
+                self.last_result = 'uncertain'
                 request = requests.post(self.webhook_url,
                     data=json.dumps(payload),
-                    headers={'Content-Type': 'application/json'})
+                    headers={'Content-Type': 'application/json'}, timeout=10)
 
                 request.raise_for_status()
 
+                self.last_result = 'sent'
                 return True
 
             except requests.exceptions.RequestException as error:
-                print('Error: %s' % error)
+                response = getattr(error, 'response', None)
+                if response is not None and 400 <= response.status_code < 500 and response.status_code != 408:
+                    self.last_result = 'rejected'
+                print('Error: Slack webhook request failed ({}).'.format(type(error).__name__))
                 return False
 
 
@@ -129,9 +145,9 @@ class ITADRequestError(RuntimeError):
 class ITADClient:
     STORES_URL = "https://api.isthereanydeal.com/service/shops/v1"
     DEALS_URL = "https://api.isthereanydeal.com/deals/v2"
+    PRICES_URL = "https://api.isthereanydeal.com/games/prices/v3"
     TIMEOUT = 15
     PAGE_LIMIT = 200
-    TOTAL_LIMIT = 4000
 
     @staticmethod
     def _http_error_message(endpoint, response, api_key):
@@ -224,12 +240,43 @@ class ITADClient:
         except TypeError:
             raise ITADRequestError("ITAD store list response has an unexpected format.") from None
 
+    def get_current_prices(self, game_ids, params):
+        query = {'country': params.get('country') or 'US', 'deals': not params.get('nondeals', False)}
+        if params.get('shops'):
+            query['shops'] = params['shops']
+        api_key = params.get('key')
+        try:
+            response = requests.post(
+                self.PRICES_URL, params=query, json=game_ids,
+                headers={'ITAD-API-Key': api_key} if api_key else None, timeout=self.TIMEOUT,
+            )
+            response.raise_for_status()
+        except requests.exceptions.HTTPError as error:
+            if error.response is None:
+                raise ITADRequestError('ITAD prices request failed with no response details.') from None
+            raise ITADRequestError(self._http_error_message('prices', error.response, api_key)) from None
+        except requests.exceptions.RequestException as error:
+            raise ITADRequestError('ITAD prices request failed ({}).'.format(type(error).__name__)) from None
+        try:
+            data = response.json()
+            if not isinstance(data, list) or not all(
+                isinstance(item, dict) and isinstance(item.get('id'), str) and isinstance(item.get('deals'), list)
+                for item in data
+            ):
+                raise ValueError
+            return data
+        except ValueError:
+            raise ITADRequestError('ITAD prices response has an unexpected format.') from None
+
     def get_deals(self, params):
+        return [item for page in self.iter_deal_pages(params) for item in page]
+
+    def iter_deal_pages(self, params):
         query = dict(params)
         api_key = query.pop('key', None)
-        requested_limit = int(query.pop('limit', self.PAGE_LIMIT) or self.PAGE_LIMIT)
-        total_limit = min(requested_limit, self.TOTAL_LIMIT)
-        if total_limit < 1:
+        requested_limit = query.pop('limit', self.PAGE_LIMIT)
+        total_limit = None if requested_limit is None else int(self.PAGE_LIMIT if requested_limit == '' else requested_limit)
+        if total_limit is not None and total_limit < 1:
             raise ValueError("The deals limit must be at least 1.")
 
         offset = int(query.pop('offset', 0) or 0)
@@ -242,9 +289,9 @@ class ITADClient:
         query.setdefault('mature', False)
         query = {key: value for key, value in query.items() if value not in (None, '')}
 
-        deals = []
-        while len(deals) < total_limit:
-            page_limit = min(self.PAGE_LIMIT, total_limit - len(deals))
+        received = 0
+        while total_limit is None or received < total_limit:
+            page_limit = self.PAGE_LIMIT if total_limit is None else min(self.PAGE_LIMIT, total_limit - received)
             page_params = dict(query, offset=offset, limit=page_limit)
             response = self._get_json(self.DEALS_URL, page_params, "deals list", api_key)
             try:
@@ -256,15 +303,14 @@ class ITADClient:
             except (KeyError, TypeError):
                 raise ITADRequestError("ITAD deals list response has an unexpected format.") from None
 
-            deals.extend(page[:total_limit - len(deals)])
-            if not has_more or len(deals) >= total_limit:
+            page = page[:page_limit]
+            received += len(page)
+            yield page
+            if not has_more or (total_limit is not None and received >= total_limit):
                 break
             if next_offset <= offset:
                 raise ITADRequestError("ITAD deals pagination returned a non-advancing offset.")
             offset = next_offset
-
-        return deals
-
 
 def resolve_shops(store_filter, api_client, country='US'):
     if not isinstance(store_filter, dict):
@@ -327,7 +373,8 @@ class Bot_Profile:
             "min_discount_percent" : lambda game :  game.price_cut >= self.game_filters[ 'min_discount_percent' ],
             "min_price_old" : lambda game :  game.price_old > self.game_filters[ 'min_price_old' ],
             "max_price_new" : lambda game :  game.price_new <= self.game_filters[ 'max_price_new' ],
-            "exclude_keywords" : self.passes_exclude_keywords
+            "exclude_keywords" : self.passes_exclude_keywords,
+            "include_keywords" : self.passes_include_keywords
         }
 
         if profile_info != None:
@@ -364,6 +411,17 @@ class Bot_Profile:
             game.title.lower().translate(str.maketrans('', '', string.punctuation)).split()
         )
         return keywords.isdisjoint(title_words)
+
+    def passes_include_keywords(self, game):
+        keywords = {
+            keyword.strip().lower()
+            for keyword in self.game_filters.get('include_keywords', '').split(',')
+            if keyword.strip()
+        }
+        title_words = set(
+            game.title.lower().translate(str.maketrans('', '', string.punctuation)).split()
+        )
+        return not keywords or not keywords.isdisjoint(title_words)
 
     def load_tracking_info(self, create_if_missing=True):
         try:
@@ -450,8 +508,11 @@ class Bot_Profile:
                 tracked_records.append(record)
                 known_records.add(key)
 
-        with open(self.tracking_json, 'w') as tracking_file:
+        tracking_path = Path(self.tracking_json)
+        temporary = tracking_path.with_name(tracking_path.name + '.tmp')
+        with temporary.open('w') as tracking_file:
             json.dump(tracked_records, tracking_file, indent=4)
+        temporary.replace(tracking_path)
         self.tracking_info = tracked_records
         print(str(self.tracking_json) + " updated!")
 
@@ -542,12 +603,14 @@ default_settings = json.dumps( {
                     "mature": False
                 },
             "web_hook_address": "",
+            "max_posts_per_day": 10,
             "store_filter": { 
                                 "exclude": ["itchio"]
                             },
             "game_filters": {
                 "max_price_new": 0.00,
-                "exclude_keywords": "hentai,demo"
+                "exclude_keywords": "hentai,demo",
+                "include_keywords": ""
             },
             "tracking_json" : "posted_default.json"
   } }, sort_keys=True, indent=4 )
@@ -690,6 +753,108 @@ def _redact_run_error(error, profile_info):
     return message
 
 
+def _local_day():
+    return datetime.now().astimezone().date().isoformat()
+
+
+def _sync_delivery_tracking(bot, state, state_id):
+    records = state.sent_records(state_id)
+    tracked = {(record.get('url'), record.get('price_cut', 0.0)) for record in bot.tracking_info}
+    if any((record.get('url'), record.get('price_cut', 0.0)) not in tracked for record in records):
+        bot.posted_records = records
+        bot.update_tracking_json()
+
+
+def _execute_queued_profile(bot, state, state_id, maximum, run_record):
+    _sync_delivery_tracking(bot, state, state_id)
+    used, sent_today = state.counts(state_id, _local_day())
+    if used < maximum:
+        try:
+            for page in bot.api_client.iter_deal_pages(bot.api_params):
+                for item in page:
+                    run_record['candidates'] += 1
+                    game = Game(item)
+                    if not bot.game_filter_check(game):
+                        run_record['filtered'] += 1
+                    elif bot.game_tracking_check(game):
+                        run_record['duplicates'] += 1
+                    else:
+                        state.enqueue(state_id, item)
+                        run_record['eligible'] += 1
+        except ITADRequestError as error:
+            message = str(error)
+            api_key = bot.api_params.get('key')
+            if api_key:
+                message = message.replace(api_key, '[REDACTED]')
+            print('Discovery incomplete: {}. Processing saved candidates.'.format(message))
+            run_record['discovery_incomplete'] = True
+
+        queued = state.queued(state_id)
+        for start in range(0, len(queued), ITADClient.PAGE_LIMIT):
+            batch = queued[start:start + ITADClient.PAGE_LIMIT]
+            game_ids = list(dict.fromkeys(item['id'] for _, item in batch))
+            prices = bot.api_client.get_current_prices(game_ids, bot.api_params)
+            by_id = {item['id']: item['deals'] for item in prices}
+            if any(game_id not in by_id for game_id in game_ids):
+                raise ITADRequestError('ITAD prices response omitted queued games; queue retained.')
+            for entry_id, item in batch:
+                day = _local_day()
+                used, _ = state.counts(state_id, day)
+                if used >= maximum:
+                    break
+                shop_id = item['deal']['shop']['id']
+                if state.blocked(state_id, item['id'], shop_id):
+                    continue
+                allowed_shops = set(bot.api_params.get('shops', '').split(','))
+                current = next((deal for deal in by_id[item['id']]
+                                if deal.get('shop', {}).get('id') == shop_id), None)
+                if current is None or str(shop_id) not in allowed_shops:
+                    state.remove(entry_id)
+                    continue
+                item['deal'] = current
+                game = Game(item)
+                if game.expiry:
+                    expiry = datetime.fromisoformat(game.expiry.replace('Z', '+00:00'))
+                    if expiry.tzinfo is None:
+                        raise ValueError('ITAD returned a deal expiry without a time zone.')
+                    if expiry <= datetime.now(timezone.utc):
+                        state.remove(entry_id)
+                        continue
+                if not bot.game_filter_check(game) or bot.game_tracking_check(game):
+                    state.remove(entry_id)
+                    continue
+                game.create_web_hook(bot.web_hook_address)
+                if game.web_hook is None:
+                    raise ValueError('No valid webhook configured.')
+                state.update_payload(entry_id, item)
+                delivery_id = state.reserve(state_id, entry_id, _local_day(), maximum)
+                if delivery_id is None:
+                    break
+                if game.send_web_hook():
+                    state.confirm(delivery_id, game.output_record())
+                    run_record['sent'] += 1
+                    _sync_delivery_tracking(bot, state, state_id)
+                else:
+                    run_record['failed'] += 1
+                    if game.web_hook.last_result == 'rejected':
+                        state.reject(delivery_id)
+                    else:
+                        print('Delivery {} is uncertain and requires review.'.format(delivery_id))
+                    break
+                time.sleep(2.0)
+            else:
+                continue
+            break
+    used, sent_today = state.counts(state_id, _local_day())
+    run_record['queued'] = len(state.queued(state_id))
+    run_record['uncertain'] = len(state.uncertain(state_id))
+    run_record['sent_today'] = sent_today
+    run_record['remaining_today'] = max(0, maximum - used)
+    print('Queue: {}; sent today: {}; uncertain: {}; remaining: {}.'.format(
+        run_record['queued'], sent_today, run_record['uncertain'], run_record['remaining_today']
+    ))
+
+
 def run_profile(profile_info, profile_name):
     started = datetime.now(timezone.utc)
     start_time = time.monotonic()
@@ -707,7 +872,8 @@ def run_profile(profile_info, profile_name):
 
     lock_file = None
     try:
-        lock_file = acquire_profile_run_lock(profile_name)
+        state_id = profile_info.get('state_id', profile_name)
+        lock_file = acquire_profile_run_lock(state_id)
         if lock_file is None:
             run_record['status'] = 'skipped'
             run_record['error'] = 'Another run for this profile is already active.'
@@ -715,19 +881,16 @@ def run_profile(profile_info, profile_name):
         elif not validate_profiles({profile_name: profile_info}):
             raise ValueError("Profile configuration is incomplete.")
         else:
+            maximum = profile_info.get('max_posts_per_day', 10)
+            if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 1:
+                raise ValueError('Daily post limit must be a positive whole number.')
             bot = Bot_Profile(profile_info, profile_name)
-            bot.get_games()
-            run_record['candidates'] = bot.candidate_count
-            run_record['filtered'] = bot.filtered_count
-            run_record['duplicates'] = bot.duplicate_count
-            run_record['eligible'] = len(bot.games)
-            bot.send_games()
-            run_record['sent'] = bot.sent_count
-            run_record['failed'] = bot.failed_count
-
-            if bot.sent_count:
-                bot.update_tracking_json()
-            run_record['status'] = 'partial' if bot.failed_count else 'success'
+            state = DeliveryState(get_app_data_directory() / 'delivery-state.sqlite3')
+            try:
+                _execute_queued_profile(bot, state, state_id, maximum, run_record)
+            finally:
+                state.close()
+            run_record['status'] = 'partial' if run_record['failed'] or run_record.get('discovery_incomplete') else 'success'
     except Exception as error:
         run_record['error'] = _redact_run_error(error, profile_info)
         print("Run failed: {}".format(run_record['error']))
@@ -775,6 +938,37 @@ def run_webhook_test(profile_info, profile_name):
     return succeeded
 
 
+def manage_uncertain_deliveries(profile_info, profile_name, delivery_id=None, outcome=None, confirmed=False):
+    state_id = profile_info.get('state_id', profile_name)
+    lock_file = acquire_profile_run_lock(state_id)
+    if lock_file is None:
+        raise ValueError('Another run for this profile is already active.')
+    try:
+        state = DeliveryState(get_app_data_directory() / 'delivery-state.sqlite3')
+        try:
+            uncertain = state.uncertain(state_id)
+            if delivery_id is None:
+                for entry_id, day, item in uncertain:
+                    print('{} | {} | {} | {}'.format(entry_id, day, item['title'], item['deal']['shop']['name']))
+                print('{} uncertain deliveries.'.format(len(uncertain)))
+                return
+            if not confirmed or outcome not in ('sent', 'not-sent'):
+                raise ValueError('Specify --outcome sent or not-sent and --confirm after checking the channel.')
+            item = next((item for entry_id, _, item in uncertain if entry_id == delivery_id), None)
+            if item is None:
+                raise ValueError('No uncertain delivery with that ID for this profile.')
+            if outcome == 'sent':
+                state.confirm(delivery_id, Game(item).output_record())
+                print('Delivery marked sent; tracking will sync on the next profile run.')
+            else:
+                state.reject(delivery_id)
+                print('Delivery returned to the queue.')
+        finally:
+            state.close()
+    finally:
+        release_profile_run_lock(lock_file)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Find deals and post them to configured webhooks.")
     diagnostic_modes = parser.add_mutually_exclusive_group()
@@ -782,6 +976,11 @@ def main(argv=None):
     diagnostic_modes.add_argument("--dry-run", metavar="PROFILE", help="Fetch and filter deals without sending or saving.")
     diagnostic_modes.add_argument("--run-profile", metavar="PROFILE", help="Run one configured profile and record its result.")
     diagnostic_modes.add_argument("--test-webhook", metavar="PROFILE", help="Send one test message without fetching deals or updating tracking.")
+    diagnostic_modes.add_argument("--list-uncertain", metavar="PROFILE", help="List deliveries requiring review.")
+    diagnostic_modes.add_argument("--resolve-uncertain", metavar="PROFILE", help="Resolve a reviewed delivery.")
+    parser.add_argument('--delivery-id', type=int, help='ID of the uncertain delivery to resolve.')
+    parser.add_argument('--outcome', choices=['sent', 'not-sent'], help='Confirmed delivery outcome.')
+    parser.add_argument('--confirm', action='store_true', help='Confirm the delivery outcome after checking the destination.')
     args = parser.parse_args(argv)
 
     print(
@@ -791,13 +990,21 @@ def main(argv=None):
     )
     settings = load_json_settings(settings_json)
 
-    if args.check_api or args.dry_run or args.run_profile or args.test_webhook:
-        profile_name = args.check_api or args.dry_run or args.run_profile or args.test_webhook
+    if args.check_api or args.dry_run or args.run_profile or args.test_webhook or args.list_uncertain or args.resolve_uncertain:
+        profile_name = args.check_api or args.dry_run or args.run_profile or args.test_webhook or args.list_uncertain or args.resolve_uncertain
         profile_info = settings.get(profile_name)
         if profile_info is None:
             print("Unknown profile '{}'.".format(profile_name))
             return 1
         try:
+            if args.list_uncertain:
+                manage_uncertain_deliveries(profile_info, profile_name)
+                return 0
+            if args.resolve_uncertain:
+                if args.delivery_id is None:
+                    raise ValueError('Specify --delivery-id when resolving a delivery.')
+                manage_uncertain_deliveries(profile_info, profile_name, args.delivery_id, args.outcome, args.confirm)
+                return 0
             if args.test_webhook:
                 return 0 if run_webhook_test(profile_info, profile_name) else 1
             if args.check_api:

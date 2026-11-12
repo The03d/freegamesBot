@@ -47,7 +47,21 @@ py src\free_games_bot_ui.py
 
 Select a profile and use **Test Webhook** to send one timestamped probe without fetching deals or changing tracking. **Run Profile** executes that profile's normal deal workflow. The dashboard can also create or remove daily and weekly Windows Task Scheduler jobs for the selected profile; scheduled tasks continue to run when the dashboard is closed.
 
-Only successfully delivered games are added to tracking, so failed deliveries can be retried on a later run. Run statistics and schedules are stored under `%LOCALAPPDATA%\FreeGamesBot`; scheduled task logs are stored there as well. The existing no-argument script invocation continues to run all configured profiles.
+Use **Manage Profiles** to add, edit, rename, or remove profiles. Leave the deal limit blank to search all available pages, and set the maximum posts per day for each profile. Remove a profile's scheduled task before renaming or deleting it. Removing a profile retains its tracking file, queue and daily state; recreating it with the same name restores that state. Saving a profile moves legacy `store_filter.exclude_keywords` settings into `game_filters`.
+
+Each profile defaults to 10 deal posts per local calendar day across all its runs. Profiles using the same webhook have separate limits. The allowance resets at local midnight, but queued deals are only sent when the profile next runs. Existing tracking files do not contain posting dates, so the daily count starts with the new delivery ledger.
+
+Matching deals are saved in a persistent queue and checked against current ITAD prices and profile filters before sending. Expired, unavailable, or no longer eligible offers are discarded. Unlimited searches can take longer and trigger ITAD rate limits; already discovered candidates remain queued. Queue and delivery state are stored in `%LOCALAPPDATA%\FreeGamesBot\delivery-state.sqlite3` (or `FREEGAMESBOT_DATA_DIR` when configured). Keep this database with the tracking files: deleting it resets the queue and daily counts. Rename profiles through the dashboard to preserve their state.
+
+Only confirmed deliveries are added to tracking. If a webhook times out or the process stops during a send, the delivery may already have reached the channel. The bot reserves a daily slot and does not retry that game until it is reviewed. List uncertain deliveries, check the channel, and confirm the outcome:
+
+```powershell
+py src\free_games_bot.py --list-uncertain Bot_Name
+py src\free_games_bot.py --resolve-uncertain Bot_Name --delivery-id 1 --outcome sent --confirm
+py src\free_games_bot.py --resolve-uncertain Bot_Name --delivery-id 1 --outcome not-sent --confirm
+```
+
+Use exactly one outcome after checking. `sent` records the delivery; `not-sent` releases the reservation and returns the deal to the queue. An explicit **Test Webhook** probe is not counted as a deal post. Run statistics and schedules are stored under `%LOCALAPPDATA%\FreeGamesBot`; scheduled task logs are stored there as well. The existing no-argument script invocation continues to run all configured profiles.
 
 ## Recommended:
 You can also optionally use [Task Scheduler](https://docs.microsoft.com/en-us/windows/win32/taskschd/task-scheduler-start-page) in Windows to run this script as often as you like. <br />
@@ -60,7 +74,7 @@ The API Parameters are key value pairs that are sent to the ITAD web API to spec
 
 * `key : ` The ITAD API key, sent in the `ITAD-API-Key` request header.
 * `offset : ` The starting position for the deals list; defaults to `0`.
-* `limit : ` The total number of deals to inspect. ITAD returns at most 200 per request; the script fetches additional pages up to this limit.
+* `limit : ` The total number of deals to inspect, or `null` for unlimited. ITAD returns at most 200 per request; the script fetches additional pages until the limit or the end of the list.
 * `country : ` Filters deals by [country](https://en.wikipedia.org/wiki/ISO_3166-1_alpha-2#Officially_assigned_code_elements) and determines the returned currency.
 * `shops : ` Numeric ITAD shop IDs, resolved from the `store_filter` names or IDs.
 * `sort : ` V2 sort expression, e.g. `-cut` for largest discounts first.
@@ -69,12 +83,14 @@ The API Parameters are key value pairs that are sent to the ITAD web API to spec
 
 ### Other Parameters
 * `web_hook_address : `The address of the webhook from your discord channel.
+* `max_posts_per_day : `Maximum confirmed deal posts per profile per local calendar day; defaults to `10`. Uncertain deliveries reserve a slot until reviewed.
 * `store_filter : `Can either `exclude` or `include` shops from the complete list of shops.  The value here will inform what gets sent to the ITAD API.
 * `game_filters : `The script will go through the data downloaded from ITAD and filter it based on criteria.
     * `min_discount_percent : `The minimum discount to report in percent, e.g., `80.0`.
     * `min_price_old : `The minimum before-sale price to report in dollars, e.g., `60.00`.
     * `max_price_new : `The maximum sale price to report, e.g., `20.00`.
     * `exclude_keywords : `Any problem keywords in game titles you don't want to hear about, e.g., `"demo,schweet,minion"`.
+    * `include_keywords : `Comma-separated title words to include, e.g., `"puzzle,adventure"`. At least one must match; an empty string allows all titles. Both keyword filters match whole words case-insensitively after removing punctuation.
 * `tracking_json : `The filename of the tracking json to be created.  It's so you can give a unique name to your record per profile.  The record is the bot's memory of what it posted yesterday, e.g., `"posted_all_free.json"` or `posted_steam_discount.json`, named for their filters.
 
 For example, to find free Steam games while excluding titles containing `hentai`, set the shop and game filters like this:

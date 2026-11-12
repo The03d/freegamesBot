@@ -1,10 +1,13 @@
 import hashlib
 import json
+import math
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import threading
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 import tkinter.messagebox as messagebox
@@ -12,9 +15,9 @@ import tkinter.messagebox as messagebox
 import customtkinter as ctk
 
 try:
-    from .free_games_bot import get_app_data_directory, run_history_path
+    from .free_games_bot import DeliveryState, acquire_profile_run_lock, get_app_data_directory, release_profile_run_lock, run_history_path
 except ImportError:
-    from free_games_bot import get_app_data_directory, run_history_path
+    from free_games_bot import DeliveryState, acquire_profile_run_lock, get_app_data_directory, release_profile_run_lock, run_history_path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +25,235 @@ BOT_SCRIPT = Path(__file__).resolve().with_name('free_games_bot.py')
 TASKS_DIRECTORY = get_app_data_directory() / 'tasks'
 SCHEDULES_PATH = get_app_data_directory() / 'schedules.json'
 HISTORY_LIMIT = 40
+
+
+def build_profile(values, existing=None):
+    profile = json.loads(json.dumps(existing or {}))
+    api_params = profile.setdefault('api_params', {})
+    store_filter = profile.setdefault('store_filter', {})
+    game_filters = profile.setdefault('game_filters', {})
+
+    for key in ('key', 'country', 'sort', 'region'):
+        api_params[key] = values[key].strip()
+    if not api_params['country']:
+        raise ValueError('Country is required.')
+    try:
+        api_params['limit'] = int(values['limit']) if values['limit'].strip() else None
+        api_params['offset'] = int(values['offset'] or '0')
+        profile['max_posts_per_day'] = int(values['max_posts_per_day'])
+    except ValueError:
+        raise ValueError('Limit and offset must be whole numbers.') from None
+    if (api_params['limit'] is not None and api_params['limit'] < 1) or api_params['offset'] < 0 or profile['max_posts_per_day'] < 1:
+        raise ValueError('Limits must be positive and offset must be nonnegative.')
+    api_params.setdefault('shops', '')
+    api_params['nondeals'] = values['nondeals']
+    api_params['mature'] = values['mature']
+    profile['web_hook_address'] = values['web_hook_address'].strip()
+    profile['tracking_json'] = values['tracking_json'].strip()
+    if not profile['tracking_json']:
+        raise ValueError('Tracking file is required.')
+
+    shops = [shop.strip() for shop in values['shops'].split(',') if shop.strip()]
+    mode = values['store_mode'].lower()
+    if mode not in ('include', 'exclude'):
+        raise ValueError('Choose an include or exclude shop filter.')
+    if mode == 'include' and not shops:
+        raise ValueError('Enter at least one shop to include.')
+    store_filter.pop('include', None)
+    store_filter.pop('exclude', None)
+    store_filter.pop('exclude_keywords', None)
+    store_filter[mode] = shops
+
+    for key in ('min_discount_percent', 'min_price_old', 'max_price_new'):
+        value = values[key].strip()
+        if not value:
+            game_filters.pop(key, None)
+            continue
+        try:
+            number = float(value)
+        except ValueError:
+            raise ValueError('{} must be a number.'.format(key)) from None
+        if not math.isfinite(number) or number < 0 or (key == 'min_discount_percent' and number > 100):
+            raise ValueError('{} is out of range.'.format(key))
+        game_filters[key] = number
+    for key in ('exclude_keywords', 'include_keywords'):
+        game_filters[key] = values[key].strip()
+    return profile
+
+
+class ProfileManager(ctk.CTkToplevel):
+    FIELDS = (
+        ('name', 'Profile name'),
+        ('key', 'ITAD API key'),
+        ('web_hook_address', 'Webhook URL'),
+        ('tracking_json', 'Tracking file'),
+        ('country', 'Country'),
+        ('limit', 'Deal limit (blank for unlimited)'),
+        ('max_posts_per_day', 'Maximum posts per day'),
+        ('offset', 'Offset'),
+        ('sort', 'Sort'),
+        ('region', 'Region'),
+        ('shops', 'Shops (comma-separated names or IDs)'),
+        ('min_discount_percent', 'Minimum discount (%)'),
+        ('min_price_old', 'Minimum original price'),
+        ('max_price_new', 'Maximum sale price'),
+        ('exclude_keywords', 'Exclude title keywords'),
+        ('include_keywords', 'Include title keywords'),
+    )
+
+    def __init__(self, app):
+        super().__init__(app)
+        self.app = app
+        self.original_name = None
+        self.title('Profile Manager')
+        self.geometry('620x760')
+        self.minsize(480, 500)
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+        toolbar = ctk.CTkFrame(self, fg_color='transparent')
+        toolbar.grid(row=0, column=0, sticky='ew', padx=16, pady=12)
+        toolbar.grid_columnconfigure(0, weight=1)
+        self.selection = ctk.StringVar(value='')
+        self.profile_menu = ctk.CTkOptionMenu(toolbar, variable=self.selection, values=['No profiles'], command=self._select)
+        self.profile_menu.grid(row=0, column=0, sticky='ew', padx=(0, 8))
+        ctk.CTkButton(toolbar, text='New', width=70, command=self._new).grid(row=0, column=1, padx=4)
+        ctk.CTkButton(toolbar, text='Remove', width=80, command=self._remove).grid(row=0, column=2, padx=4)
+
+        form = ctk.CTkScrollableFrame(self)
+        form.grid(row=1, column=0, sticky='nsew', padx=16, pady=(0, 8))
+        form.grid_columnconfigure(1, weight=1)
+        self.entries = {}
+        for row, (key, label) in enumerate(self.FIELDS):
+            ctk.CTkLabel(form, text=label, anchor='w').grid(row=row, column=0, sticky='w', padx=8, pady=5)
+            entry = ctk.CTkEntry(form, show='*' if key in ('key', 'web_hook_address') else '')
+            entry.grid(row=row, column=1, sticky='ew', padx=8, pady=5)
+            self.entries[key] = entry
+        row = len(self.FIELDS)
+        ctk.CTkLabel(form, text='Shop filter').grid(row=row, column=0, sticky='w', padx=8, pady=5)
+        self.store_mode = ctk.StringVar(value='Exclude')
+        ctk.CTkSegmentedButton(form, values=['Include', 'Exclude'], variable=self.store_mode).grid(
+            row=row, column=1, sticky='w', padx=8, pady=5
+        )
+        self.nondeals = ctk.BooleanVar(value=False)
+        self.mature = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(form, text='Include non-deals', variable=self.nondeals).grid(
+            row=row + 1, column=1, sticky='w', padx=8, pady=5
+        )
+        ctk.CTkCheckBox(form, text='Include mature games', variable=self.mature).grid(
+            row=row + 2, column=1, sticky='w', padx=8, pady=5
+        )
+        ctk.CTkButton(self, text='Save Profile', command=self._save).grid(row=2, column=0, sticky='e', padx=16, pady=(0, 16))
+        self._refresh_menu()
+        selected = app.profile_var.get()
+        self._select(selected) if selected in app.settings else self._new()
+
+    def _refresh_menu(self):
+        self.profile_menu.configure(values=list(self.app.settings) or ['No profiles'])
+
+    def _populate(self, name, profile):
+        api = profile.get('api_params', {})
+        stores = profile.get('store_filter', {})
+        filters = profile.get('game_filters', {})
+        mode = 'Include' if 'include' in stores else 'Exclude'
+        values = {
+            'name': name,
+            'key': api.get('key', ''),
+            'web_hook_address': profile.get('web_hook_address', ''),
+            'tracking_json': profile.get('tracking_json', ''),
+            'country': api.get('country', 'CA'),
+            'limit': api.get('limit', 4000) if api.get('limit', 4000) is not None else '',
+            'max_posts_per_day': profile.get('max_posts_per_day', 10),
+            'offset': api.get('offset', 0),
+            'sort': api.get('sort', '-cut'),
+            'region': api.get('region', ''),
+            'shops': ', '.join(str(shop) for shop in stores.get(mode.lower(), [])),
+            'exclude_keywords': filters.get('exclude_keywords', stores.get('exclude_keywords', '')),
+            'include_keywords': filters.get('include_keywords', ''),
+        }
+        for key in ('min_discount_percent', 'min_price_old', 'max_price_new'):
+            values[key] = filters.get(key, '' if profile else (0 if key == 'max_price_new' else ''))
+        for key, entry in self.entries.items():
+            entry.delete(0, 'end')
+            entry.insert(0, str(values[key]))
+        self.store_mode.set(mode)
+        self.nondeals.set(api.get('nondeals', False))
+        self.mature.set(api.get('mature', False))
+
+    def _new(self):
+        self.original_name = None
+        self.selection.set('New profile')
+        self._populate('', {})
+
+    def _select(self, name):
+        if name in self.app.settings:
+            self.original_name = name
+            self.selection.set(name)
+            self._populate(name, self.app.settings[name])
+
+    def _save(self):
+        try:
+            values = {key: entry.get() for key, entry in self.entries.items()}
+            name = values['name'].strip()
+            if not name:
+                raise ValueError('Profile name is required.')
+            if name != self.original_name and name in self.app.settings:
+                raise ValueError('A profile with that name already exists.')
+            if self.original_name and name != self.original_name and self.original_name in self.app._read_schedules():
+                raise ValueError('Remove this profile\'s schedule before renaming it.')
+            values.update(store_mode=self.store_mode.get(), nondeals=self.nondeals.get(), mature=self.mature.get())
+            profile = build_profile(values, self.app.settings.get(self.original_name))
+            if self.original_name:
+                profile['state_id'] = profile.get('state_id', self.original_name)
+            else:
+                state = DeliveryState(get_app_data_directory() / 'delivery-state.sqlite3')
+                try:
+                    profile['state_id'] = state.removed_profile_id(name) or str(uuid.uuid4())
+                finally:
+                    state.close()
+                if any(entry.get('state_id', other_name) == profile['state_id']
+                       for other_name, entry in self.app.settings.items()):
+                    raise ValueError('This profile\'s retained state belongs to another active profile.')
+            settings = dict(self.app.settings)
+            if self.original_name and name != self.original_name:
+                del settings[self.original_name]
+            settings[name] = profile
+            self.app._save_profiles(settings, name)
+            self.original_name = name
+            self._refresh_menu()
+            self.selection.set(name)
+        except (OSError, ValueError, TypeError, sqlite3.Error) as error:
+            messagebox.showerror('Could not save profile', str(error), parent=self)
+
+    def _remove(self):
+        name = self.original_name
+        if not name:
+            return
+        if name in self.app._read_schedules():
+            messagebox.showerror('Schedule exists', 'Remove this profile\'s schedule first.', parent=self)
+            return
+        if not messagebox.askyesno('Remove profile', 'Remove profile {}? Tracking, queue and daily state will be kept.'.format(name), parent=self):
+            return
+        lock_file = None
+        try:
+            settings = dict(self.app.settings)
+            state_id = settings[name].get('state_id', name)
+            lock_file = acquire_profile_run_lock(state_id)
+            if lock_file is None:
+                raise ValueError('This profile is running. Try again after it completes.')
+            state = DeliveryState(get_app_data_directory() / 'delivery-state.sqlite3')
+            try:
+                state.remember_profile(name, state_id)
+            finally:
+                state.close()
+            del settings[name]
+            self.app._save_profiles(settings)
+            self._refresh_menu()
+            self._new()
+        except (OSError, ValueError, sqlite3.Error) as error:
+            messagebox.showerror('Could not remove profile', str(error), parent=self)
+        finally:
+            if lock_file is not None:
+                release_profile_run_lock(lock_file)
 
 
 class FreeGamesBotApp(ctk.CTk):
@@ -34,6 +266,7 @@ class FreeGamesBotApp(ctk.CTk):
         ctk.set_default_color_theme('blue')
 
         self.settings = {}
+        self.settings_loaded = False
         self.running = False
         self.schedules = self._read_schedules()
         self.profile_var = ctk.StringVar(value='')
@@ -85,6 +318,8 @@ class FreeGamesBotApp(ctk.CTk):
             command=self._run_all,
         )
         self.run_all_button.grid(row=1, column=1, sticky='w', padx=8, pady=(0, 12))
+        self.manage_button = ctk.CTkButton(actions, text='Manage Profiles', command=self._manage_profiles)
+        self.manage_button.grid(row=1, column=2, padx=6, pady=(0, 12))
 
         schedule = ctk.CTkFrame(self)
         schedule.grid(row=2, column=0, sticky='ew', padx=20, pady=8)
@@ -156,13 +391,39 @@ class FreeGamesBotApp(ctk.CTk):
         settings_path = PROJECT_ROOT / 'settings.json'
         try:
             self.settings = json.loads(settings_path.read_text(encoding='utf-8'))
-        except (OSError, json.JSONDecodeError) as error:
+            if not isinstance(self.settings, dict):
+                raise ValueError('Settings must contain a profile object.')
+            self.settings_loaded = True
+        except FileNotFoundError:
+            self.settings = {}
+            self.settings_loaded = True
+        except (OSError, ValueError) as error:
             messagebox.showerror('Settings unavailable', '{}: {}'.format(type(error).__name__, error))
             self.settings = {}
+            self.settings_loaded = False
+        self._refresh_profile_menu()
+
+    def _refresh_profile_menu(self, selected=None):
         profiles = list(self.settings)
         self.profile_menu.configure(values=profiles or ['No profiles'])
-        if profiles:
-            self.profile_var.set(profiles[0])
+        self.profile_var.set(selected if selected is not None and selected in profiles else (profiles[0] if profiles else 'No profiles'))
+
+    def _save_profiles(self, settings, selected=None):
+        settings_path = PROJECT_ROOT / 'settings.json'
+        temporary = settings_path.with_suffix('.json.tmp')
+        temporary.write_text(json.dumps(settings, indent=4) + '\n', encoding='utf-8')
+        temporary.replace(settings_path)
+        self.settings = settings
+        self._refresh_profile_menu(selected)
+        self.status_var.set('Profiles updated')
+
+    def _manage_profiles(self):
+        if not self.settings_loaded:
+            messagebox.showerror('Settings unavailable', 'Fix the settings file before managing profiles.')
+            return
+        manager = ProfileManager(self)
+        manager.transient(self)
+        manager.grab_set()
 
     def _selected_profile(self):
         profile = self.profile_var.get()
@@ -178,6 +439,7 @@ class FreeGamesBotApp(ctk.CTk):
         self.webhook_button.configure(state=state)
         self.run_all_button.configure(state=state)
         self.save_schedule_button.configure(state=state)
+        self.manage_button.configure(state=state)
 
     def _write_output(self, text):
         self.output.configure(state='normal')
@@ -209,7 +471,6 @@ class FreeGamesBotApp(ctk.CTk):
                     cwd=PROJECT_ROOT,
                     capture_output=True,
                     text=True,
-                    timeout=1800,
                     check=False,
                 )
                 self.after(0, self._finish_process, result.returncode, result.stdout + result.stderr)
@@ -227,7 +488,7 @@ class FreeGamesBotApp(ctk.CTk):
     def _run_all(self):
         if messagebox.askyesno(
             'Run all profiles',
-            'This can post every eligible game for every configured profile and update their tracking files. Continue?',
+            'Run all profiles with their daily posting limits and update their tracking files?',
         ):
             self._launch()
 
@@ -410,7 +671,7 @@ class FreeGamesBotApp(ctk.CTk):
         for child in self.history_list.winfo_children():
             child.destroy()
 
-        headings = ('Started', 'Profile', 'Result', 'Deals', 'Eligible', 'Sent', 'Failed', 'Seconds')
+        headings = ('Started', 'Profile', 'Result', 'Deals', 'Eligible', 'Sent', 'Queued', 'Left', 'Uncertain', 'Failed', 'Seconds')
         for column, heading in enumerate(headings):
             ctk.CTkLabel(self.history_list, text=heading, font=ctk.CTkFont(weight='bold')).grid(
                 row=0, column=column, sticky='w', padx=5, pady=4
@@ -438,6 +699,9 @@ class FreeGamesBotApp(ctk.CTk):
                 record.get('candidates', 0),
                 record.get('eligible', 0),
                 record.get('sent', 0),
+                record.get('queued', ''),
+                record.get('remaining_today', ''),
+                record.get('uncertain', ''),
                 record.get('failed', 0),
                 record.get('duration_seconds', ''),
             )
