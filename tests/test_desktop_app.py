@@ -1,4 +1,3 @@
-import os
 import json
 import tempfile
 import tkinter
@@ -97,8 +96,8 @@ class DesktopAppTests(unittest.TestCase):
 
     def test_profile_manager_create_edit_rename_and_remove(self):
         with tempfile.TemporaryDirectory() as temp_dir, \
-                patch.dict(os.environ, {'FREEGAMESBOT_DATA_DIR': temp_dir}), \
                 patch('src.free_games_bot_ui.PROJECT_ROOT', Path(temp_dir)), \
+            patch.object(FreeGamesBotApp, '_remove_legacy_scheduled_tasks'), \
                 patch.object(FreeGamesBotApp, '_read_schedules', return_value={}), \
                 patch.object(FreeGamesBotApp, '_refresh_all'), \
                 patch('src.free_games_bot_ui.messagebox.askyesno', return_value=True):
@@ -146,9 +145,8 @@ class DesktopAppTests(unittest.TestCase):
         self.assertTrue(issubclass(FreeGamesBotApp, ctk.CTk))
 
     def test_profile_lock_prevents_overlapping_runs(self):
-        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
-            os.environ,
-            {'FREEGAMESBOT_DATA_DIR': temp_dir},
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            'src.free_games_bot.PROJECT_ROOT', Path(temp_dir)
         ):
             first_lock = acquire_profile_run_lock('Daily Profile')
             self.assertIsNotNone(first_lock)
@@ -161,17 +159,32 @@ class DesktopAppTests(unittest.TestCase):
 
     def test_schedule_launcher_is_valid_python_and_quotes_profile_safely(self):
         profile = 'Profile "with" spaces; & symbols'
-        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
-            os.environ,
-            {'FREEGAMESBOT_DATA_DIR': temp_dir},
-        ), patch('src.free_games_bot_ui.TASKS_DIRECTORY', Path(temp_dir) / 'tasks'):
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            'src.free_games_bot_ui.PROJECT_ROOT', Path(temp_dir)
+        ), patch('src.free_games_bot_ui.TASKS_DIRECTORY', Path(temp_dir) / 'data' / 'tasks'):
             app = object.__new__(FreeGamesBotApp)
             launcher = app._launcher_path(profile)
             source = launcher.read_text(encoding='utf-8')
 
             compile(source, str(launcher), 'exec')
             self.assertIn(repr(profile), source)
+            expected_log_path = Path(temp_dir) / 'data' / ('scheduled-' + app._profile_slug(profile) + '.log')
+            self.assertIn(repr(str(expected_log_path)), source)
             self.assertNotEqual(launcher.suffix, '.cmd')
+
+    def test_legacy_task_cleanup_removes_only_unversioned_tasks_once(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            marker = Path(temp_dir) / 'data' / 'legacy-tasks-cleaned-v2'
+            query_result = Mock(returncode=0, stdout='"\\FreeGamesBot-Old","Ready"\n"\\FreeGamesBot-v2-New","Ready"\n"\\Other","Ready"\n', stderr='')
+            delete_result = Mock(returncode=0, stdout='', stderr='')
+            with patch('src.free_games_bot_ui.LEGACY_TASK_CLEANUP_MARKER', marker), \
+                    patch('src.free_games_bot_ui.subprocess.run', side_effect=[query_result, delete_result]) as run:
+                FreeGamesBotApp._remove_legacy_scheduled_tasks()
+                FreeGamesBotApp._remove_legacy_scheduled_tasks()
+
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(run.call_args_list[1].args[0][-1], '\\FreeGamesBot-Old')
+            self.assertTrue(marker.exists())
 
     def test_next_run_calculates_daily_and_weekly_times(self):
         now = datetime(2026, 11, 11, 13, 30)

@@ -1,3 +1,4 @@
+import csv
 import hashlib
 import json
 import math
@@ -15,15 +16,18 @@ import tkinter.messagebox as messagebox
 import customtkinter as ctk
 
 try:
-    from .free_games_bot import DeliveryState, acquire_profile_run_lock, get_app_data_directory, migrate_project_data, project_settings_path, release_profile_run_lock, run_history_path
+    from .free_games_bot import DeliveryState, acquire_profile_run_lock, delivery_state_path, migrate_project_data, project_data_directory, project_settings_path, release_profile_run_lock, resolve_tracking_path, run_history_path
 except ImportError:
-    from free_games_bot import DeliveryState, acquire_profile_run_lock, get_app_data_directory, migrate_project_data, project_settings_path, release_profile_run_lock, run_history_path
+    from free_games_bot import DeliveryState, acquire_profile_run_lock, delivery_state_path, migrate_project_data, project_data_directory, project_settings_path, release_profile_run_lock, resolve_tracking_path, run_history_path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BOT_SCRIPT = Path(__file__).resolve().with_name('free_games_bot.py')
-TASKS_DIRECTORY = get_app_data_directory() / 'tasks'
-SCHEDULES_PATH = get_app_data_directory() / 'schedules.json'
+TASKS_DIRECTORY = project_data_directory(PROJECT_ROOT) / 'tasks'
+SCHEDULES_PATH = project_data_directory(PROJECT_ROOT) / 'schedules.json'
+LEGACY_TASK_PREFIX = 'FreeGamesBot-'
+TASK_PREFIX = 'FreeGamesBot-v2-'
+LEGACY_TASK_CLEANUP_MARKER = project_data_directory(PROJECT_ROOT) / 'legacy-tasks-cleaned-v2'
 HISTORY_LIMIT = 40
 
 
@@ -52,6 +56,10 @@ def build_profile(values, existing=None):
     profile['tracking_json'] = values['tracking_json'].strip()
     if not profile['tracking_json']:
         raise ValueError('Tracking file is required.')
+    try:
+        resolve_tracking_path(profile['tracking_json'], PROJECT_ROOT)
+    except ValueError:
+        raise ValueError('Tracking file must be a relative path inside the project data directory.') from None
 
     shops = [shop.strip() for shop in values['shops'].split(',') if shop.strip()]
     mode = values['store_mode'].lower()
@@ -205,7 +213,7 @@ class ProfileManager(ctk.CTkToplevel):
             if self.original_name:
                 profile['state_id'] = profile.get('state_id', self.original_name)
             else:
-                state = DeliveryState(get_app_data_directory() / 'delivery-state.sqlite3')
+                state = DeliveryState(delivery_state_path(PROJECT_ROOT))
                 try:
                     profile['state_id'] = state.removed_profile_id(name) or str(uuid.uuid4())
                 finally:
@@ -237,10 +245,10 @@ class ProfileManager(ctk.CTkToplevel):
         try:
             settings = dict(self.app.settings)
             state_id = settings[name].get('state_id', name)
-            lock_file = acquire_profile_run_lock(state_id)
+            lock_file = acquire_profile_run_lock(state_id, PROJECT_ROOT)
             if lock_file is None:
                 raise ValueError('This profile is running. Try again after it completes.')
-            state = DeliveryState(get_app_data_directory() / 'delivery-state.sqlite3')
+            state = DeliveryState(delivery_state_path(PROJECT_ROOT))
             try:
                 state.remember_profile(name, state_id)
             finally:
@@ -273,6 +281,13 @@ class FreeGamesBotApp(ctk.CTk):
         self.frequency_var = ctk.StringVar(value='Daily')
         self.weekday_var = ctk.StringVar(value='SUN')
         self.status_var = ctk.StringVar(value='Ready')
+
+        if os.name == 'nt':
+            try:
+                self._remove_legacy_scheduled_tasks()
+            except (OSError, RuntimeError) as error:
+                self.status_var.set('Legacy scheduled task cleanup failed')
+                messagebox.showwarning('Scheduled task cleanup failed', str(error), parent=self)
 
         self._build_ui()
         self._load_profiles()
@@ -510,7 +525,39 @@ class FreeGamesBotApp(ctk.CTk):
         return '{}-{}'.format(readable[:44], digest)
 
     def _task_name(self, profile):
-        return 'FreeGamesBot-{}'.format(self._profile_slug(profile))
+        return '{}{}'.format(TASK_PREFIX, self._profile_slug(profile))
+
+    @staticmethod
+    def _remove_legacy_scheduled_tasks():
+        if LEGACY_TASK_CLEANUP_MARKER.exists():
+            return
+        result = subprocess.run(
+            ['schtasks.exe', '/Query', '/FO', 'CSV', '/NH'],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or 'Could not query scheduled tasks.')
+
+        legacy_tasks = []
+        for row in csv.reader(result.stdout.splitlines()):
+            if not row:
+                continue
+            task_name = row[0].lstrip('\\/')
+            if task_name.startswith(LEGACY_TASK_PREFIX) and not task_name.startswith(TASK_PREFIX):
+                legacy_tasks.append(row[0])
+        for task_name in legacy_tasks:
+            result = subprocess.run(
+                ['schtasks.exe', '/Delete', '/F', '/TN', task_name],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode:
+                raise RuntimeError(result.stderr.strip() or result.stdout.strip() or 'Could not remove task {}.'.format(task_name))
+        LEGACY_TASK_CLEANUP_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        LEGACY_TASK_CLEANUP_MARKER.write_text('done\n', encoding='utf-8')
 
     @staticmethod
     def _read_schedules():
@@ -529,7 +576,7 @@ class FreeGamesBotApp(ctk.CTk):
         TASKS_DIRECTORY.mkdir(parents=True, exist_ok=True)
         slug = self._profile_slug(profile)
         launcher = TASKS_DIRECTORY / (slug + '.py')
-        log_path = get_app_data_directory() / ('scheduled-' + slug + '.log')
+        log_path = project_data_directory(PROJECT_ROOT) / ('scheduled-' + slug + '.log')
         content = '\n'.join((
             'import subprocess',
             'import sys',
@@ -680,7 +727,7 @@ class FreeGamesBotApp(ctk.CTk):
             )
 
         try:
-            lines = run_history_path().read_text(encoding='utf-8').splitlines()
+            lines = run_history_path(PROJECT_ROOT).read_text(encoding='utf-8').splitlines()
         except FileNotFoundError:
             lines = []
         except OSError as error:

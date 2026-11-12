@@ -23,20 +23,45 @@ from src.free_games_bot import (
     run_api_check,
     resolve_tracking_path,
     migrate_project_data,
+    delivery_state_path,
+    run_history_path,
     validate_profiles,
 )
 
 
 class ProjectDataPathTests(unittest.TestCase):
-    def test_tracking_paths_are_anchored_and_absolute_paths_are_preserved(self):
+    def test_tracking_paths_are_anchored_inside_project_data(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self.assertEqual(resolve_tracking_path('posted.json', root), root / 'data' / 'posted.json')
-            self.assertEqual(resolve_tracking_path('custom/posted.json', root), root / 'custom' / 'posted.json')
+            self.assertEqual(resolve_tracking_path('custom/posted.json', root), root / 'data' / 'custom' / 'posted.json')
             absolute = root / 'external' / 'posted.json'
-            self.assertEqual(resolve_tracking_path(str(absolute), root), absolute)
-            (root / 'posted.json').write_text('[]', encoding='utf-8')
-            self.assertEqual(resolve_tracking_path('posted.json', root, allow_legacy=True), root / 'posted.json')
+            with self.assertRaisesRegex(ValueError, 'relative path'):
+                resolve_tracking_path(str(absolute), root)
+            with self.assertRaisesRegex(ValueError, 'inside the project data directory'):
+                resolve_tracking_path('../external/posted.json', root)
+            self.assertEqual(delivery_state_path(root), root / 'data' / 'delivery-state.sqlite3')
+            self.assertEqual(run_history_path(root), root / 'data' / 'run-history.jsonl')
+            lock_file = acquire_profile_run_lock('Test', root)
+            try:
+                self.assertEqual(len(list((root / 'data' / 'run-locks').glob('*.lock'))), 1)
+            finally:
+                release_profile_run_lock(lock_file)
+
+    def test_migration_preserves_nested_tracking_subdirectories(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / 'project'
+            tracking = root / 'custom' / 'posted.json'
+            tracking.parent.mkdir(parents=True)
+            tracking.write_text('[]', encoding='utf-8')
+            (root / 'settings.json').write_text(
+                json.dumps({'Test': {'tracking_json': 'custom/posted.json'}}), encoding='utf-8'
+            )
+
+            migrate_project_data(root)
+
+            self.assertEqual((root / 'data' / 'custom' / 'posted.json').read_text(encoding='utf-8'), '[]')
+            self.assertFalse(tracking.exists())
 
     def test_tracking_path_rejects_conflicting_copies(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -44,11 +69,14 @@ class ProjectDataPathTests(unittest.TestCase):
             (root / 'data').mkdir()
             (root / 'posted.json').write_text('[1]', encoding='utf-8')
             (root / 'data' / 'posted.json').write_text('[2]', encoding='utf-8')
-            with self.assertRaisesRegex(ValueError, 'Conflicting tracking files'):
-                resolve_tracking_path('posted.json', root, allow_legacy=True)
+            (root / 'settings.json').write_text(
+                json.dumps({'Test': {'tracking_json': 'posted.json'}}), encoding='utf-8'
+            )
+            with self.assertRaisesRegex(ValueError, 'Conflicting project data'):
+                migrate_project_data(root)
 
     def test_migration_preserves_settings_and_tracking_bytes(self):
-        with tempfile.TemporaryDirectory() as temp_dir, patch.dict('os.environ', {'FREEGAMESBOT_DATA_DIR': temp_dir}):
+        with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / 'project'
             root.mkdir()
             settings = b'{"Example": {"tracking_json": "posted_example.json"}}\n'
@@ -63,7 +91,7 @@ class ProjectDataPathTests(unittest.TestCase):
             migrate_project_data(root)
 
     def test_migration_conflict_does_not_modify_either_copy(self):
-        with tempfile.TemporaryDirectory() as temp_dir, patch.dict('os.environ', {'FREEGAMESBOT_DATA_DIR': temp_dir}):
+        with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / 'project'
             (root / 'data').mkdir(parents=True)
             (root / 'settings.json').write_text('{}', encoding='utf-8')
@@ -76,7 +104,7 @@ class ProjectDataPathTests(unittest.TestCase):
             self.assertFalse((root / 'data' / 'settings.json').exists())
 
     def test_interrupted_migration_can_resume_without_losing_records(self):
-        with tempfile.TemporaryDirectory() as temp_dir, patch.dict('os.environ', {'FREEGAMESBOT_DATA_DIR': temp_dir}):
+        with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / 'project'
             (root / 'data').mkdir(parents=True)
             (root / 'settings.json').write_text('{"Test": {"tracking_json": "posted_test.json"}}')
@@ -88,47 +116,48 @@ class ProjectDataPathTests(unittest.TestCase):
             self.assertFalse((root / 'settings.json').exists())
 
     def test_malformed_settings_and_active_profile_prevent_migration(self):
-        with tempfile.TemporaryDirectory() as temp_dir, patch.dict('os.environ', {'FREEGAMESBOT_DATA_DIR': temp_dir}):
+        with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / 'project'
             root.mkdir()
             settings_path = root / 'settings.json'
             settings_path.write_text('{invalid')
             with self.assertRaises(json.JSONDecodeError):
                 migrate_project_data(root)
-            self.assertFalse((root / 'data').exists())
+            self.assertFalse((root / 'data' / 'settings.json').exists())
             settings_path.write_text('{"Test": {"tracking_json": "posted_test.json"}}')
-            lock_file = acquire_profile_run_lock('Test')
+            lock_file = acquire_profile_run_lock('Test', root)
             try:
                 with self.assertRaisesRegex(ValueError, 'profile is running'):
                     migrate_project_data(root)
             finally:
                 release_profile_run_lock(lock_file)
             self.assertTrue(settings_path.exists())
-            self.assertFalse((root / 'data').exists())
+            self.assertFalse((root / 'data' / 'settings.json').exists())
 
     def test_completed_migration_does_not_block_on_running_profile(self):
-        with tempfile.TemporaryDirectory() as temp_dir, patch.dict('os.environ', {'FREEGAMESBOT_DATA_DIR': temp_dir}):
+        with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / 'project'
             (root / 'data').mkdir(parents=True)
             (root / 'data' / 'settings.json').write_text('{"Test": {}}')
-            lock_file = acquire_profile_run_lock('Test')
+            lock_file = acquire_profile_run_lock('Test', root)
             try:
                 migrate_project_data(root)
             finally:
                 release_profile_run_lock(lock_file)
 
-    def test_absolute_tracking_file_in_project_root_is_not_moved(self):
-        with tempfile.TemporaryDirectory() as temp_dir, patch.dict('os.environ', {'FREEGAMESBOT_DATA_DIR': temp_dir}):
+    def test_absolute_tracking_path_is_not_migrated_and_is_rejected_at_use(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / 'project'
             root.mkdir()
-            tracking = root / 'posted_external.json'
-            tracking.write_text('[]')
+            tracking = Path(temp_dir) / 'outside' / 'posted_external.json'
             (root / 'settings.json').write_text(json.dumps({'Test': {'tracking_json': str(tracking)}}))
             migrate_project_data(root)
-            self.assertTrue(tracking.exists())
-            self.assertFalse((root / 'data' / tracking.name).exists())
+            with self.assertRaisesRegex(ValueError, 'relative path'):
+                resolve_tracking_path(str(tracking), root)
+            self.assertFalse(tracking.exists())
+            self.assertTrue((root / 'data' / 'settings.json').exists())
 
-    def test_diagnostics_read_legacy_files_without_migrating_from_another_cwd(self):
+    def test_diagnostics_migrate_legacy_files_from_another_cwd(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / 'project'
             root.mkdir()
@@ -146,8 +175,8 @@ class ProjectDataPathTests(unittest.TestCase):
                 dry_run.assert_called_once()
             finally:
                 os.chdir(original_cwd)
-            self.assertTrue(settings_path.exists())
-            self.assertFalse((root / 'data').exists())
+            self.assertFalse(settings_path.exists())
+            self.assertTrue((root / 'data' / 'settings.json').exists())
 
 
 class DeliveryStateTests(unittest.TestCase):
@@ -174,8 +203,8 @@ class DeliveryStateTests(unittest.TestCase):
             state.close()
 
     def test_uncertain_delivery_requires_confirmation_and_can_be_requeued(self):
-        with tempfile.TemporaryDirectory() as temp_dir, patch.dict('os.environ', {'FREEGAMESBOT_DATA_DIR': temp_dir}):
-            state = DeliveryState(Path(temp_dir) / 'delivery-state.sqlite3')
+        with tempfile.TemporaryDirectory() as temp_dir, patch('src.free_games_bot.PROJECT_ROOT', Path(temp_dir)):
+            state = DeliveryState(delivery_state_path(temp_dir))
             item = {'id': 'game', 'title': 'Game', 'deal': {'shop': {'id': 61, 'name': 'Steam'}, 'cut': 100}}
             state.enqueue('profile', item)
             entry_id, _ = state.queued('profile')[0]
@@ -189,7 +218,7 @@ class DeliveryStateTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'confirm'):
                 manage_uncertain_deliveries({}, 'profile', delivery_id, 'not-sent')
             manage_uncertain_deliveries({}, 'profile', delivery_id, 'not-sent', confirmed=True)
-            state = DeliveryState(Path(temp_dir) / 'delivery-state.sqlite3')
+            state = DeliveryState(delivery_state_path(temp_dir))
             self.assertEqual(state.counts('profile', '2026-11-11'), (0, 0))
             self.assertEqual(len(state.queued('profile')), 2)
             self.assertFalse(state.blocked('profile', 'game', 61))
@@ -216,29 +245,32 @@ class QueuedRunTests(unittest.TestCase):
             {'id': item['id'], 'deals': [item['deal']]} for item in offers if item['id'] in ids
         ]
         with tempfile.TemporaryDirectory() as temp_dir:
+            data_directory = Path(temp_dir) / 'data'
+            data_directory.mkdir()
+            tracking_path = data_directory / 'tracking.json'
             profile = {
                 'api_params': {'key': 'key', 'country': 'CA', 'limit': None},
                 'store_filter': {'include': ['Steam']}, 'game_filters': {'max_price_new': 0},
                 'web_hook_address': 'https://discord.com/api/webhooks/test/token',
-                'tracking_json': str(Path(temp_dir) / 'tracking.json'),
+                'tracking_json': 'tracking.json',
             }
-            with patch.dict('os.environ', {'FREEGAMESBOT_DATA_DIR': temp_dir}), \
+            with patch('src.free_games_bot.PROJECT_ROOT', Path(temp_dir)), \
                     patch('src.free_games_bot.ITADClient', return_value=client) as client_class, \
                     patch('src.free_games_bot.requests.post', return_value=Mock()) as post, \
                     patch('src.free_games_bot.time.sleep'), \
                     patch('src.free_games_bot._local_day', return_value='2026-11-11') as day:
                 client_class.PAGE_LIMIT = 200
                 first = run_profile(profile, 'Test')
-                Path(profile['tracking_json']).write_text('[]')
+                tracking_path.write_text('[]')
                 second = run_profile(profile, 'Test')
                 self.assertEqual((first['sent'], first['queued'], second['sent']), (10, 15, 0))
-                self.assertEqual(len(json.loads(Path(profile['tracking_json']).read_text())), 10)
+                self.assertEqual(len(json.loads(tracking_path.read_text())), 10)
                 self.assertEqual(post.call_count, 10)
                 day.return_value = '2026-11-12'
                 third = run_profile(profile, 'Test')
                 self.assertEqual((third['sent'], third['queued']), (10, 5))
                 self.assertEqual(post.call_count, 20)
-                self.assertEqual(len(json.loads(Path(profile['tracking_json']).read_text())), 20)
+                self.assertEqual(len(json.loads(tracking_path.read_text())), 20)
 
     def test_expired_and_changed_price_are_not_posted(self):
         offers = [self.make_offer(0), self.make_offer(1)]
@@ -254,10 +286,10 @@ class QueuedRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             profile = {
                 'api_params': {'key': 'key', 'country': 'CA'}, 'store_filter': {'include': ['Steam']},
-                'game_filters': {'max_price_new': 0}, 'tracking_json': str(Path(temp_dir) / 'tracking.json'),
+                'game_filters': {'max_price_new': 0}, 'tracking_json': 'tracking.json',
                 'web_hook_address': 'https://discord.com/api/webhooks/test/token',
             }
-            with patch.dict('os.environ', {'FREEGAMESBOT_DATA_DIR': temp_dir}), \
+            with patch('src.free_games_bot.PROJECT_ROOT', Path(temp_dir)), \
                     patch('src.free_games_bot.ITADClient', return_value=client) as client_class, \
                     patch('src.free_games_bot.requests.post') as post:
                 client_class.PAGE_LIMIT = 200
@@ -274,10 +306,10 @@ class QueuedRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             profile = {
                 'api_params': {'key': 'key', 'country': 'CA'}, 'store_filter': {'include': ['Steam']},
-                'game_filters': {'max_price_new': 0}, 'tracking_json': str(Path(temp_dir) / 'tracking.json'),
+                'game_filters': {'max_price_new': 0}, 'tracking_json': 'tracking.json',
                 'web_hook_address': 'https://discord.com/api/webhooks/test/token',
             }
-            with patch.dict('os.environ', {'FREEGAMESBOT_DATA_DIR': temp_dir}), \
+            with patch('src.free_games_bot.PROJECT_ROOT', Path(temp_dir)), \
                     patch('src.free_games_bot.ITADClient', return_value=client) as client_class, \
                     patch('src.free_games_bot.requests.post', side_effect=requests.exceptions.ReadTimeout) as post:
                 client_class.PAGE_LIMIT = 200
@@ -298,10 +330,10 @@ class QueuedRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             profile = {
                 'api_params': {'key': 'key', 'country': 'CA'}, 'store_filter': {'include': ['Steam']},
-                'game_filters': {'max_price_new': 0}, 'tracking_json': str(Path(temp_dir) / 'tracking.json'),
+                'game_filters': {'max_price_new': 0}, 'tracking_json': 'tracking.json',
                 'web_hook_address': 'https://discord.com/api/webhooks/test/token',
             }
-            with patch.dict('os.environ', {'FREEGAMESBOT_DATA_DIR': temp_dir}), \
+            with patch('src.free_games_bot.PROJECT_ROOT', Path(temp_dir)), \
                     patch('src.free_games_bot.ITADClient', return_value=client) as client_class, \
                     patch('src.free_games_bot.requests.post', return_value=Mock()) as post, \
                     patch('src.free_games_bot.time.sleep'):
@@ -320,15 +352,15 @@ class QueuedRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             profile = {
                 'api_params': {'key': 'key', 'country': 'CA'}, 'store_filter': {'include': ['Steam']},
-                'game_filters': {'max_price_new': 0}, 'tracking_json': str(Path(temp_dir) / 'tracking.json'),
+                'game_filters': {'max_price_new': 0}, 'tracking_json': 'tracking.json',
                 'web_hook_address': 'https://discord.com/api/webhooks/test/token',
             }
-            with patch.dict('os.environ', {'FREEGAMESBOT_DATA_DIR': temp_dir}), \
+            with patch('src.free_games_bot.PROJECT_ROOT', Path(temp_dir)), \
                     patch('src.free_games_bot.ITADClient', return_value=client) as client_class, \
                     patch('src.free_games_bot.requests.post') as post:
                 client_class.PAGE_LIMIT = 200
                 result = run_profile(profile, 'Test')
-                state = DeliveryState(Path(temp_dir) / 'delivery-state.sqlite3')
+                state = DeliveryState(Path(temp_dir) / 'data' / 'delivery-state.sqlite3')
                 self.assertEqual(len(state.queued('Test')), 1)
                 state.close()
             self.assertEqual(result['status'], 'failed')
@@ -557,12 +589,11 @@ class ProfileDiagnosticTests(unittest.TestCase):
         self.assertFalse(validate_profiles(settings, require_webhook=True))
 
     def test_legacy_keyword_setting_is_applied(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            profile = Bot_Profile(
-                self.profile_settings(Path(temp_dir) / 'tracking.json'),
-                api_client=self.profile_api_client(),
-                read_only=True,
-            )
+        profile = Bot_Profile(
+            self.profile_settings('tracking.json'),
+            api_client=self.profile_api_client(),
+            read_only=True,
+        )
 
         rejected_game = SimpleNamespace(title='A demo, game', price_new=1)
         accepted_game = SimpleNamespace(title='A complete game', price_new=1)
@@ -620,8 +651,8 @@ class ProfileDiagnosticTests(unittest.TestCase):
         self.assertFalse(profile.game_filter_check(Game(hentai_offer)))
 
     def test_dry_run_discovery_does_not_create_tracking_or_webhooks(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            tracking_path = Path(temp_dir) / 'tracking.json'
+        with tempfile.TemporaryDirectory() as temp_dir, patch('src.free_games_bot.PROJECT_ROOT', Path(temp_dir)):
+            tracking_path = Path(temp_dir) / 'data' / 'tracking.json'
             api_client = Mock()
             api_client.get_all_shops.return_value = [{'id': 61, 'title': 'Steam'}]
             api_client.get_deals.return_value = [
@@ -642,7 +673,7 @@ class ProfileDiagnosticTests(unittest.TestCase):
                 }
             ]
             profile = Bot_Profile(
-                self.profile_settings(tracking_path),
+                self.profile_settings('tracking.json'),
                 api_client=api_client,
                 read_only=True,
             )
@@ -657,12 +688,13 @@ class ProfileDiagnosticTests(unittest.TestCase):
             self.assertFalse(tracking_path.exists())
 
     def test_tracking_comparison_matches_url_and_discount(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            tracking_path = Path(temp_dir) / 'tracking.json'
+        with tempfile.TemporaryDirectory() as temp_dir, patch('src.free_games_bot.PROJECT_ROOT', Path(temp_dir)):
+            tracking_path = Path(temp_dir) / 'data' / 'tracking.json'
+            tracking_path.parent.mkdir(parents=True)
             tracking_path.write_text('[{"url": "https://example.test/game", "price_cut": 50}]')
             original_tracking = tracking_path.read_text()
             profile = Bot_Profile(
-                self.profile_settings(tracking_path),
+                self.profile_settings('tracking.json'),
                 api_client=self.profile_api_client(),
                 read_only=True,
             )
@@ -675,10 +707,11 @@ class ProfileDiagnosticTests(unittest.TestCase):
             self.assertEqual(tracking_path.read_text(), original_tracking)
 
     def test_only_successfully_sent_games_are_added_to_tracking(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            tracking_path = Path(temp_dir) / 'tracking.json'
+        with tempfile.TemporaryDirectory() as temp_dir, patch('src.free_games_bot.PROJECT_ROOT', Path(temp_dir)):
+            tracking_path = Path(temp_dir) / 'data' / 'tracking.json'
+            tracking_path.parent.mkdir(parents=True)
             profile = Bot_Profile(
-                self.profile_settings(tracking_path),
+                self.profile_settings('tracking.json'),
                 api_client=self.profile_api_client(),
             )
             posted_record = {'url': 'https://example.test/posted', 'price_cut': 100}
@@ -714,14 +747,14 @@ class ProfileDiagnosticTests(unittest.TestCase):
             bot.sent_count = 1
             bot.failed_count = 1
 
-            with patch.dict('os.environ', {'FREEGAMESBOT_DATA_DIR': temp_dir}), \
+            with patch('src.free_games_bot.PROJECT_ROOT', Path(temp_dir)), \
                     patch('src.free_games_bot.validate_profiles', return_value=True), \
                     patch('src.free_games_bot.Bot_Profile', side_effect=RuntimeError(
                         'failure private-api-key https://discord.test/private-webhook'
                     )):
                 result = run_profile(profile_info, 'Test')
 
-            history = (Path(temp_dir) / 'run-history.jsonl').read_text().splitlines()
+            history = (Path(temp_dir) / 'data' / 'run-history.jsonl').read_text().splitlines()
             record = json.loads(history[0])
             self.assertEqual(result['status'], 'failed')
             self.assertNotIn('private-api-key', record['error'])
@@ -743,7 +776,7 @@ class ProfileDiagnosticTests(unittest.TestCase):
 
             def execute(bot, state, state_id, maximum, record):
                 record.update(candidates=5, filtered=2, duplicates=1, eligible=2, sent=2, failed=0)
-            with patch.dict('os.environ', {'FREEGAMESBOT_DATA_DIR': temp_dir}), \
+            with patch('src.free_games_bot.PROJECT_ROOT', Path(temp_dir)), \
                     patch('src.free_games_bot.validate_profiles', return_value=True), \
                     patch('src.free_games_bot.Bot_Profile', return_value=bot), \
                     patch('src.free_games_bot._execute_queued_profile', side_effect=execute):

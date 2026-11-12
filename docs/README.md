@@ -12,7 +12,7 @@ Create an "app" to get an API Key from [IsThereAnyDeal](https://isthereanydeal.c
 
 [Get a Discord webhook set up on your server](https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks) and add the url you receive to the `settings.json` . <br />
 
-Settings and bare tracking filenames are stored in the project's `data` folder. On normal startup, existing root-level settings and posted-game files are migrated without overwriting conflicting files. Diagnostics read legacy files without moving them. Explicit absolute tracking paths are unchanged; relative paths containing directories are resolved from the project root. Back up `data` together with the separate app-data queue database described below. The `data` folder is Git-ignored, but its settings are not encrypted.
+Settings, tracking files, delivery state, run history, locks, schedules, launcher scripts, and scheduled-task logs are stored in the project's `data` folder. Startup migrates eligible legacy root-level settings and tracking files into `data` without overwriting conflicting files. Tracking paths must be relative to `data` and cannot escape it. Existing AppData files are not imported; legacy `FreeGamesBot-*` scheduled tasks are removed once when the dashboard starts. The `data` folder is Git-ignored, but its settings are not encrypted.
 
 ## Testing
 Run the offline component tests from the project root. They use mocked HTTP requests and do not contact ITAD, Discord, or Slack:
@@ -53,7 +53,7 @@ Use **Manage Profiles** to add, edit, rename, or remove profiles. Leave the deal
 
 Each profile defaults to 10 deal posts per local calendar day across all its runs. Profiles using the same webhook have separate limits. The allowance resets at local midnight, but queued deals are only sent when the profile next runs. Existing tracking files do not contain posting dates, so the daily count starts with the new delivery ledger.
 
-Matching deals are saved in a persistent queue and checked against current ITAD prices and profile filters before sending. Expired, unavailable, or no longer eligible offers are discarded. Unlimited searches can take longer and trigger ITAD rate limits; already discovered candidates remain queued. Queue and delivery state are stored in `%LOCALAPPDATA%\FreeGamesBot\delivery-state.sqlite3` (or `FREEGAMESBOT_DATA_DIR` when configured). Keep this database with the tracking files: deleting it resets the queue and daily counts. Rename profiles through the dashboard to preserve their state.
+Matching deals are saved in a persistent queue and checked against current ITAD prices and profile filters before sending. Expired, unavailable, or no longer eligible offers are discarded. Unlimited searches can take longer and trigger ITAD rate limits; already discovered candidates remain queued. Queue and delivery state are stored in `data/delivery-state.sqlite3`. Keep this database with the tracking files: deleting it resets the queue and daily counts. Rename profiles through the dashboard to preserve their state.
 
 Only confirmed deliveries are added to tracking. If a webhook times out or the process stops during a send, the delivery may already have reached the channel. The bot reserves a daily slot and does not retry that game until it is reviewed. List uncertain deliveries, check the channel, and confirm the outcome:
 
@@ -63,7 +63,7 @@ py src\free_games_bot.py --resolve-uncertain Bot_Name --delivery-id 1 --outcome 
 py src\free_games_bot.py --resolve-uncertain Bot_Name --delivery-id 1 --outcome not-sent --confirm
 ```
 
-Use exactly one outcome after checking. `sent` records the delivery; `not-sent` releases the reservation and returns the deal to the queue. An explicit **Test Webhook** probe is not counted as a deal post. Run statistics and schedules are stored under `%LOCALAPPDATA%\FreeGamesBot`; scheduled task logs are stored there as well. The existing no-argument script invocation continues to run all configured profiles.
+Use exactly one outcome after checking. `sent` records the delivery; `not-sent` releases the reservation and returns the deal to the queue. An explicit **Test Webhook** probe is not counted as a deal post. Run statistics, schedules, launcher scripts, and scheduled-task logs are stored in `data/`. The existing no-argument script invocation continues to run all configured profiles.
 
 ## Recommended:
 You can also optionally use [Task Scheduler](https://docs.microsoft.com/en-us/windows/win32/taskschd/task-scheduler-start-page) in Windows to run this script as often as you like. <br />
@@ -93,7 +93,7 @@ The API Parameters are key value pairs that are sent to the ITAD web API to spec
     * `max_price_new : `The maximum sale price to report, e.g., `20.00`.
     * `exclude_keywords : `Any problem keywords in game titles you don't want to hear about, e.g., `"demo,schweet,minion"`.
     * `include_keywords : `Comma-separated title words to include, e.g., `"puzzle,adventure"`. At least one must match; an empty string allows all titles. Both keyword filters match whole words case-insensitively after removing punctuation.
-* `tracking_json : `The filename of the tracking json to be created.  It's so you can give a unique name to your record per profile.  The record is the bot's memory of what it posted yesterday, e.g., `"posted_all_free.json"` or `posted_steam_discount.json`, named for their filters.
+* `tracking_json : `A filename or subpath relative to the project `data` folder. Absolute paths and paths that escape `data` are rejected. The record is the bot's memory of previously posted deals, e.g., `"posted_all_free.json"` or `"tracking/steam_discount.json"`.
 
 For example, to find free Steam games while excluding titles containing `hentai`, set the shop and game filters like this:
 

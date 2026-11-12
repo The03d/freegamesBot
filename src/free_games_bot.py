@@ -27,31 +27,30 @@ def project_data_directory(project_root=None):
     return Path(project_root if project_root is not None else PROJECT_ROOT) / 'data'
 
 
-def project_settings_path(project_root=None, allow_legacy=False):
+def project_settings_path(project_root=None):
     root = Path(project_root if project_root is not None else PROJECT_ROOT)
     current = project_data_directory(root) / 'settings.json'
     legacy = root / 'settings.json'
     if current.exists() and legacy.exists() and current.read_bytes() != legacy.read_bytes():
         raise ValueError('Conflicting settings files: {} and {}'.format(legacy, current))
-    if allow_legacy and not current.exists() and legacy.exists():
-        return legacy
     return current
 
 
-def resolve_tracking_path(value, project_root=None, allow_legacy=False):
+def resolve_tracking_path(value, project_root=None):
     root = Path(project_root if project_root is not None else PROJECT_ROOT)
     path = Path(value)
+    if not value or path == Path('.'):
+        raise ValueError('A tracking filename inside the project data directory is required.')
     if path.is_absolute():
-        return path
-    if path.parent != Path('.'):
-        return root / path
-    current = project_data_directory(root) / path
-    legacy = root / path
-    if current.exists() and legacy.exists() and current.read_bytes() != legacy.read_bytes():
-        raise ValueError('Conflicting tracking files: {} and {}'.format(legacy, current))
-    if allow_legacy and not current.exists() and legacy.exists():
-        return legacy
-    return current
+        raise ValueError('Tracking files must use a relative path inside the project data directory.')
+    data_directory = project_data_directory(root).resolve()
+    resolved_path = (data_directory / path).resolve()
+    try:
+        resolved_path.relative_to(data_directory)
+    except ValueError:
+        raise ValueError('Tracking files must be inside the project data directory.') from None
+    return resolved_path
+
 
 '''*******************************************************************
 ******************** Custom Webhooks Classes!!! **********************
@@ -345,6 +344,7 @@ class ITADClient:
                 raise ITADRequestError("ITAD deals pagination returned a non-advancing offset.")
             offset = next_offset
 
+
 def resolve_shops(store_filter, api_client, country='US'):
     if not isinstance(store_filter, dict):
         raise ValueError("store_filter must be an object.")
@@ -422,7 +422,7 @@ class Bot_Profile:
 
             self.games = []
 
-            self.tracking_json = resolve_tracking_path(profile_info.get('tracking_json', ''), allow_legacy=read_only)
+            self.tracking_json = resolve_tracking_path(profile_info.get('tracking_json', ''))
             self.tracking_info = self.load_tracking_info(create_if_missing=not read_only)
 
         self.session_info = []
@@ -432,7 +432,6 @@ class Bot_Profile:
         self.posted_records = []
         self.sent_count = 0
         self.failed_count = 0
-
 
     def passes_exclude_keywords(self, game):
         keywords = {
@@ -529,7 +528,6 @@ class Bot_Profile:
                 time.sleep(2.0)
         return self.sent_count, self.failed_count
 
-                
     def update_tracking_json( self ):
         tracked_records = list(self.tracking_info)
         known_records = {
@@ -549,6 +547,7 @@ class Bot_Profile:
         temporary.replace(tracking_path)
         self.tracking_info = tracked_records
         print(str(self.tracking_json) + " updated!")
+
 
 class Game:
     def __init__(self, game_info=None, currency=None):
@@ -718,29 +717,25 @@ def run_dry_run(profile_info, profile_name, api_client=None):
     return bot
 
 
-def get_app_data_directory():
-    configured_directory = os.environ.get('FREEGAMESBOT_DATA_DIR')
-    if configured_directory:
-        directory = Path(configured_directory)
-    elif os.name == 'nt':
-        directory = Path(os.environ.get('LOCALAPPDATA', Path.home() / 'AppData' / 'Local')) / 'FreeGamesBot'
-    else:
-        directory = Path.home() / '.local' / 'share' / 'FreeGamesBot'
-    directory.mkdir(parents=True, exist_ok=True)
-    return directory
+def delivery_state_path(project_root=None):
+    data_directory = project_data_directory(project_root)
+    data_directory.mkdir(parents=True, exist_ok=True)
+    return data_directory / 'delivery-state.sqlite3'
 
 
-def run_history_path():
-    return get_app_data_directory() / 'run-history.jsonl'
+def run_history_path(project_root=None):
+    return project_data_directory(project_root) / 'run-history.jsonl'
 
 
 def append_run_history(run_record):
-    with run_history_path().open('a', encoding='utf-8') as history_file:
+    history_path = run_history_path()
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    with history_path.open('a', encoding='utf-8') as history_file:
         history_file.write(json.dumps(run_record, ensure_ascii=True) + '\n')
 
 
-def acquire_profile_run_lock(profile_name):
-    lock_directory = get_app_data_directory() / 'run-locks'
+def acquire_profile_run_lock(profile_name, project_root=None):
+    lock_directory = project_data_directory(project_root) / 'run-locks'
     lock_directory.mkdir(parents=True, exist_ok=True)
     lock_name = hashlib.sha256(profile_name.encode('utf-8')).hexdigest() + '.lock'
     lock_file = (lock_directory / lock_name).open('a+b')
@@ -779,7 +774,7 @@ def release_profile_run_lock(lock_file):
 def migrate_project_data(project_root=None):
     root = Path(project_root if project_root is not None else PROJECT_ROOT)
     data_directory = project_data_directory(root)
-    migration_lock = acquire_profile_run_lock('__project_data_migration__:' + str(root.resolve()))
+    migration_lock = acquire_profile_run_lock('__project_data_migration__:' + str(root.resolve()), root)
     if migration_lock is None:
         raise ValueError('Project data migration is already running.')
     profile_locks = []
@@ -797,44 +792,45 @@ def migrate_project_data(project_root=None):
             if not isinstance(settings, dict) or not all(isinstance(profile, dict) for profile in settings.values()):
                 raise ValueError('Settings must contain a profile object.')
 
-        sources = set(root.glob('posted_*.json'))
-        absolute_paths = set()
-        bare_paths = set()
+        moves = {path: data_directory / path.name for path in root.glob('posted_*.json') if path.is_file()}
         for profile in settings.values():
             tracking = profile.get('tracking_json')
             if tracking:
                 path = Path(tracking)
                 if path.is_absolute():
-                    absolute_paths.add(path)
-                elif path.parent == Path('.'):
-                    bare_paths.add(root / path)
-        if absolute_paths & bare_paths:
-            raise ValueError('A tracking file is shared by absolute and bare paths; resolve it before migration.')
-        sources = (sources | bare_paths) - absolute_paths
+                    continue
+                legacy_path = (root / path).resolve()
+                try:
+                    legacy_path.relative_to(root.resolve())
+                except ValueError:
+                    continue
+                if legacy_path.is_file():
+                    moves[legacy_path] = data_directory / path
         if legacy_settings.exists():
-            sources.add(legacy_settings)
-        sources = {path for path in sources if path.is_file()}
-        if not sources:
+            moves[legacy_settings] = data_directory / 'settings.json'
+        moves = {source: destination for source, destination in moves.items() if source.is_file()}
+        if not moves:
             return
 
         for state_id in sorted({profile.get('state_id', name) for name, profile in settings.items()}):
-            lock_file = acquire_profile_run_lock(state_id)
+            lock_file = acquire_profile_run_lock(state_id, root)
             if lock_file is None:
                 raise ValueError('A profile is running; retry project data migration after it finishes.')
             profile_locks.append(lock_file)
         if settings_content is not None and settings_path.read_bytes() != settings_content:
             raise ValueError('Settings changed during project data migration.')
-        snapshots = {path: path.read_bytes() for path in sources}
+        snapshots = {source: source.read_bytes() for source in moves}
         for source, content in snapshots.items():
-            destination = data_directory / source.name
+            destination = moves[source]
             if destination.exists() and destination.read_bytes() != content:
                 raise ValueError('Conflicting project data files: {} and {}'.format(source, destination))
 
         if snapshots:
             data_directory.mkdir(parents=True, exist_ok=True)
         for source in sorted(snapshots, key=lambda path: path.name == 'settings.json'):
-            destination = data_directory / source.name
+            destination = moves[source]
             content = snapshots[source]
+            destination.parent.mkdir(parents=True, exist_ok=True)
             if source.read_bytes() != content:
                 raise ValueError('Project data changed during migration: {}'.format(source))
             if not destination.exists():
@@ -1002,7 +998,7 @@ def run_profile(profile_info, profile_name):
             if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 1:
                 raise ValueError('Daily post limit must be a positive whole number.')
             bot = Bot_Profile(profile_info, profile_name)
-            state = DeliveryState(get_app_data_directory() / 'delivery-state.sqlite3')
+            state = DeliveryState(delivery_state_path())
             try:
                 _execute_queued_profile(bot, state, state_id, maximum, run_record)
             finally:
@@ -1061,7 +1057,7 @@ def manage_uncertain_deliveries(profile_info, profile_name, delivery_id=None, ou
     if lock_file is None:
         raise ValueError('Another run for this profile is already active.')
     try:
-        state = DeliveryState(get_app_data_directory() / 'delivery-state.sqlite3')
+        state = DeliveryState(delivery_state_path())
         try:
             uncertain = state.uncertain(state_id)
             if delivery_id is None:
@@ -1105,11 +1101,10 @@ def main(argv=None):
         "************************ STARTING ITAD BOTS ************************\n"
         "********************************************************************"
     )
+    diagnostic = bool(args.check_api or args.dry_run)
     try:
-        diagnostic = bool(args.check_api or args.dry_run)
-        if not diagnostic:
-            migrate_project_data()
-        settings_path = project_settings_path(allow_legacy=diagnostic)
+        migrate_project_data()
+        settings_path = project_settings_path()
         settings = load_json_settings(settings_path, create_if_missing=not diagnostic)
     except (OSError, ValueError) as error:
         print('Settings unavailable ({}): {}'.format(type(error).__name__, error))
